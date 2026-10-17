@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Image Chain",
+    "description": "Dual-model image generation chain registered directly as a conversational model."
+  }
+}

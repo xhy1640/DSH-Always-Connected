@@ -1,0 +1,28 @@
+- insert:
+    - id: image-chain
+      name: dsh-plugin-image-chain
+      config:
+        chains:
+          - id: chain-default-image
+            name: "默认绘画链路"
+            type: "image"
+            enabled: true
+            imageConfig:
+              promptModelProvider: "cpa"
+              promptModelId: "gemini-3.8-flash-high"
+              imageModelProvider: "cpa"
+              imageModelId: "gemini-3.1-flash-image"
+              saveDirectory: "images/generated"
+          - id: chain-resilient-chat
+            name: "高可用容灾对话链路"
+            type: "chat"
+            enabled: true
+            chatConfig:
+              maxRetriesPerModel: 5
+              models:
+                - provider: "cpa"
+                  model: "gemini-3.8-flash-high"
+                - provider: "cpa"
+                  model: "claude-sonnet-4-6"
+                - provider: "workbuddypanel"
+                  model: "cn:deepseek-v4.1-flash"

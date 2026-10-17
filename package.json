@@ -1,0 +1,26 @@
+{
+  "name": "dsh-always-connected",
+  "version": "2.1.0",
+  "description": "DSH-Always-Connected: 全功能模型自由链路插件，提供多阶段AI绘画链路与顺序容灾无缝故障转移对话链路",
+  "private": true,
+  "type": "module",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  }
+}
