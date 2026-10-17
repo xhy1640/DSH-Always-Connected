@@ -8,7 +8,7 @@ export const name = 'image-chain';
 export const inject = ['llm', 'tools', 'fs', 'webServer', 'sessions'];
 
 /** Bump on every behavioural change so the Host log proves which generation is live. */
-const BUILD = 'always-connected/2026-10-17.4';
+const BUILD = 'always-connected/2026-10-17.5';
 
 const DEFAULT_CHAINS = [
   {
@@ -246,6 +246,42 @@ function flattenContent(content) {
     .filter(part => part && part.type === 'text')
     .map(part => part.text || '')
     .join('\n');
+}
+
+function isUserPromptMessage(msg) {
+  if (!msg || msg.role !== 'user') return false;
+  const sourceKind = msg.source?.kind;
+  if (sourceKind && sourceKind !== 'user') return false;
+  const text = flattenContent(msg.content).trim();
+  if (!text) return false;
+  if (/^Time sampled while preparing turn/i.test(text)) return false;
+  if (/^Current runtime context/i.test(text)) return false;
+  if (/^<system-reminder>[\s\S]*<\/system-reminder>$/i.test(text) || text.startsWith('<system-reminder>')) return false;
+  if (/^【meow-memory[\s\S]*提示】[\s\S]*$/i.test(text) && !text.includes('画') && !text.includes('图')) return false;
+  return true;
+}
+
+function cleanUserPromptText(raw) {
+  if (!raw) return '';
+  let text = raw
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gis, '')
+    .replace(/Current runtime context[\s\S]*$/gis, '')
+    .replace(/Time sampled while preparing turn[\s\S]*$/gis, '')
+    .replace(/【meow-memory 首次建库提示】[\s\S]*?以上是要点。/gis, '')
+    .trim();
+  return text;
+}
+
+function extractLatestUserPrompt(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (isUserPromptMessage(msg)) {
+      const text = cleanUserPromptText(flattenContent(msg.content));
+      if (text) return text;
+    }
+  }
+  return '';
 }
 
 function convertMessages(messages, system) {
@@ -588,13 +624,7 @@ class FreeChainAdapter {
   async *streamImageChain(chain, options) {
     const workspace = resolveWorkspace(this.ctx, options.sessionId);
     const messages = options.messages || [];
-    let prompt = '';
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i]?.role === 'user') {
-        prompt = flattenContent(messages[i].content);
-        break;
-      }
-    }
+    let prompt = extractLatestUserPrompt(messages);
     if (!prompt.trim()) prompt = '一只可爱的蓝白小鲸鱼';
 
     const conf = chain.imageConfig || {};
