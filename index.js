@@ -1,476 +1,557 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
 export const name = 'image-chain';
 
-export const inject = ['llm', 'tools', 'fs', 'webServer'];
+export const inject = ['llm', 'tools', 'fs', 'webServer', 'sessions'];
 
-/**
- * 简单解析 yaml 键值对或使用基础读取器
- */
-function parseSimpleYamlProfiles(content) {
-  const providers = [];
+/** Bump on every behavioural change so the Host log proves which generation is live. */
+const BUILD = 'always-connected/2026-10-17.4';
+
+const DEFAULT_CHAINS = [
+  {
+    id: 'chain-default-image',
+    name: '默认绘画链路',
+    type: 'image',
+    enabled: true,
+    imageConfig: {
+      promptModelProvider: 'cpa',
+      promptModelId: 'gemini-3.8-flash-high',
+      imageModelProvider: 'cpa',
+      imageModelId: 'gemini-3.1-flash-image',
+      saveDirectory: 'images/generated'
+    }
+  },
+  {
+    id: 'chain-resilient-chat',
+    name: '高可用容灾对话链路',
+    type: 'chat',
+    enabled: true,
+    chatConfig: {
+      maxRetriesPerModel: 5,
+      models: [
+        { provider: 'cpa', model: 'gemini-3.8-flash-high' },
+        { provider: 'cpa', model: 'claude-sonnet-4-6' },
+        { provider: 'workbuddypanel', model: 'cn:deepseek-v4.1-flash' }
+      ]
+    }
+  }
+];
+
+const DEFAULT_PROMPT_INSTRUCTION =
+  "You are an expert AI image prompt engineer. Convert the user's drawing request into an exquisite, highly-detailed English prompt for image generation.";
+
+/* ------------------------------------------------------------------ *
+ * Persistent store — the single source of truth for user chains.
+ * Lives outside the package so reinstalling / upgrading never touches it.
+ * ------------------------------------------------------------------ */
+
+function dshHome() {
+  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+}
+
+const STORAGE_DIR = path.join(dshHome(), 'storages', 'always-connected');
+const STORAGE_FILE = path.join(STORAGE_DIR, 'chains.json');
+
+function sanitizeChains(value) {
+  if (!Array.isArray(value)) return null;
+  const seen = new Set();
+  const out = [];
+  for (const raw of value) {
+    if (raw === null || typeof raw !== 'object') continue;
+    if (typeof raw.id !== 'string' || raw.id.trim() === '') continue;
+    if (seen.has(raw.id)) continue;
+    seen.add(raw.id);
+    out.push({
+      ...raw,
+      name: typeof raw.name === 'string' && raw.name.trim() !== '' ? raw.name : raw.id,
+      type: raw.type === 'image' ? 'image' : 'chat',
+      enabled: raw.enabled !== false
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+function loadPersistedChains() {
   try {
-    const lines = content.split('\n');
-    let inPiAi = false;
-    let inProviders = false;
-    let currentProvider = null;
-    let inModels = false;
+    if (!fs.existsSync(STORAGE_FILE)) return null;
+    return sanitizeChains(JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8')));
+  } catch {
+    return null;
+  }
+}
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (line.includes('id: llm-pi-ai')) {
-        inPiAi = true;
+function savePersistedChains(chains) {
+  const clean = sanitizeChains(chains);
+  if (clean === null) return false;
+  try {
+    fs.mkdirSync(STORAGE_DIR, { recursive: true });
+    const tmp = `${STORAGE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(clean, null, 2), 'utf8');
+    fs.renameSync(tmp, STORAGE_FILE);
+    return true;
+  } catch (error) {
+    console.error(`[${BUILD}] cannot persist chains:`, error);
+    return false;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Provider directory: read straight from the live profile patch.
+ * ------------------------------------------------------------------ */
+
+function readProfileText() {
+  const candidates = [
+    process.env.DSH_PROFILE_DIR ? path.join(process.env.DSH_PROFILE_DIR, 'cordis.patch.yml') : undefined,
+    path.join(dshHome(), 'profiles', 'desktop', 'cordis.patch.yml')
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf8');
+    } catch {}
+  }
+  return '';
+}
+
+function parseProviders(text) {
+  const providers = [];
+  if (!text) return providers;
+  const lines = text.split('\n');
+  let inPiAi = false;
+  let inProviders = false;
+  let current = null;
+  let inModels = false;
+
+  for (const line of lines) {
+    if (/^\s*-?\s*id:\s*llm-pi-ai\s*$/.test(line)) {
+      inPiAi = true;
+      continue;
+    }
+    if (inPiAi && /^[^\s#]/.test(line) && !/^\s*-/.test(line)) {
+      inPiAi = false;
+      inProviders = false;
+      current = null;
+    }
+    if (!inPiAi) continue;
+
+    if (/^\s*providers:\s*$/.test(line)) {
+      inProviders = true;
+      continue;
+    }
+    if (!inProviders) continue;
+
+    const prov = line.match(/^ {6}([A-Za-z0-9_.-]+):\s*$/);
+    if (prov) {
+      current = { id: prov[1], displayName: prov[1], baseURL: '', apiKeyEnv: '', models: [] };
+      providers.push(current);
+      inModels = false;
+      continue;
+    }
+    if (!current) continue;
+
+    const display = line.match(/^ {8}displayName:\s*(.+)$/);
+    if (display) { current.displayName = display[1].trim().replace(/^["']|["']$/g, ''); continue; }
+    const base = line.match(/^ {8}baseURL:\s*(.+)$/);
+    if (base) { current.baseURL = base[1].trim().replace(/^["']|["']$/g, ''); continue; }
+    const keyEnv = line.match(/^ {8}apiKeyEnv:\s*(.+)$/);
+    if (keyEnv) { current.apiKeyEnv = keyEnv[1].trim().replace(/^["']|["']$/g, ''); continue; }
+    if (/^ {8}models:\s*$/.test(line)) { inModels = true; continue; }
+
+    if (inModels) {
+      const idMatch = line.match(/^ {10,14}-\s*id:\s*(.+)$/);
+      if (idMatch) {
+        const id = idMatch[1].trim().replace(/^["']|["']$/g, '');
+        current.models.push({ id, name: id });
         continue;
       }
-      if (inPiAi && line.match(/^[a-zA-Z0-9_-]/)) {
-        inPiAi = false;
-        inProviders = false;
-      }
-      if (!inPiAi) continue;
-
-      if (line.includes('providers:')) {
-        inProviders = true;
-        continue;
-      }
-
-      const provMatch = line.match(/^ {6}([a-zA-Z0-9_-]+):/);
-      if (inProviders && provMatch) {
-        currentProvider = {
-          id: provMatch[1],
-          displayName: provMatch[1],
-          baseURL: '',
-          apiKeyEnv: '',
-          models: []
-        };
-        providers.push(currentProvider);
-        inModels = false;
-        continue;
-      }
-
-      if (currentProvider) {
-        const displayMatch = line.match(/^ {8}displayName:\s*(.+)$/);
-        if (displayMatch) currentProvider.displayName = displayMatch[1].trim();
-
-        const baseMatch = line.match(/^ {8}baseURL:\s*(.+)$/);
-        if (baseMatch) currentProvider.baseURL = baseMatch[1].trim();
-
-        const keyEnvMatch = line.match(/^ {8}apiKeyEnv:\s*(.+)$/);
-        if (keyEnvMatch) currentProvider.apiKeyEnv = keyEnvMatch[1].trim();
-
-        if (line.match(/^ {8}models:/)) {
-          inModels = true;
-          continue;
-        }
-
-        if (inModels) {
-          const modelIdMatch = line.match(/^ {10,12}-\s*id:\s*(.+)$/);
-          if (modelIdMatch) {
-            const mId = modelIdMatch[1].trim().replace(/^['"]|['"]$/g, '');
-            currentProvider.models.push({ id: mId, name: mId });
-            continue;
-          }
-          const modelNameMatch = line.match(/^ {12,14}name:\s*(.+)$/);
-          if (modelNameMatch && currentProvider.models.length > 0) {
-            const mName = modelNameMatch[1].trim().replace(/^['"]|['"]$/g, '');
-            currentProvider.models[currentProvider.models.length - 1].name = mName;
-          }
-        }
+      const nameMatch = line.match(/^ {12,16}name:\s*(.+)$/);
+      if (nameMatch && current.models.length > 0) {
+        current.models[current.models.length - 1].name =
+          nameMatch[1].trim().replace(/^["']|["']$/g, '');
       }
     }
-  } catch (err) {}
+  }
   return providers;
 }
 
-/**
- * 清洗模型A生成的提示词，移除多余前缀、问候语、中文解析与引号
- */
-function cleanGeneratedPrompt(raw) {
-  if (!raw || typeof raw !== 'string') return '';
-  let text = raw.trim();
-
-  // 1. 如果包含 Markdown 引用块 > ... 优先提取引用块中的内容
-  const quoteMatches = text.match(/^>\s*(.+)$/gm);
-  if (quoteMatches && quoteMatches.length > 0) {
-    const extracted = quoteMatches.map(line => line.replace(/^>\s*/, '').trim()).join(' ');
-    if (extracted.length > 30) {
-      text = extracted;
-    }
-  } else {
-    // 2. 如果包含 ### 核心英文提示词 (Prompt)：或者类似标记，截取之后的部分
-    const promptHeaderMatch = text.match(/(?:core\s+)?(?:image\s+)?prompt[：:]?\s*\n+([\s\S]+?)(?:\n+---|\n+###|\n+中文|$)/i);
-    if (promptHeaderMatch && promptHeaderMatch[1].trim().length > 20) {
-      text = promptHeaderMatch[1].trim();
-    }
-  }
-
-  // 3. 移除外层代码块、引号、加粗标记
-  text = text.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
-  text = text.replace(/^\*\*([\s\S]+)\*\*$/g, '$1').trim();
-  if ((text.startsWith('"') && text.endsWith('"')) ||
-      (text.startsWith('\'') && text.endsWith('\'')) ||
-      (text.startsWith('`') && text.endsWith('`'))) {
-    text = text.slice(1, -1).trim();
-  }
-
-  // 4. 移除开头的 Prompt: 或 Image Prompt: 前缀
-  text = text.replace(/^(image\s+)?prompt:\s*/i, '');
-
-  // 5. 如果首尾仍有加粗
-  text = text.replace(/^\*\*|\*\*$/g, '').trim();
-
-  return text;
+function listProviders() {
+  return parseProviders(readProfileText());
 }
 
-/**
- * 从当前 profile 中动态解析所有可用的 provider 与模型列表
- */
-function getAvailableProvidersAndModels() {
-  const profilePatchPath = path.join(
-    process.env.DSH_PROFILE_DIR || path.join(process.env.HOME || '', '.dsh/profiles/desktop'),
-    'cordis.patch.yml'
-  );
-
-  if (!fs.existsSync(profilePatchPath)) {
-    return [];
-  }
-
+function readCredential(name) {
+  if (!name) return '';
+  if (process.env[name]) return process.env[name];
   try {
-    const content = fs.readFileSync(profilePatchPath, 'utf8');
-    return parseSimpleYamlProfiles(content);
-  } catch (err) {
-    return [];
-  }
+    const text = fs.readFileSync(path.join(dshHome(), '.credentials.yaml'), 'utf8');
+    const match = text.match(new RegExp(`^\\s*${name}:\\s*(.+)$`, 'm'));
+    if (match) return match[1].trim().replace(/^["']|["']$/g, '');
+  } catch {}
+  return '';
 }
 
-/**
- * 解析特定 Provider 的 BaseURL 与 API Key
- */
-function resolveProviderEndpoint(providerKey) {
-  const providers = getAvailableProvidersAndModels();
-  const found = providers.find(p => p.id === providerKey);
-  if (!found) {
-    return {
-      baseURL: 'http://127.0.0.1:8317/v1',
-      apiKey: process.env.CPA_API_KEY || 'sk-cpa-local'
-    };
+function resolveEndpoint(providerId) {
+  const provider = listProviders().find(p => p.id === providerId);
+  if (!provider) {
+    return { baseURL: 'http://127.0.0.1:8317/v1', apiKey: readCredential('CPA_API_KEY') || 'sk-cpa-local' };
   }
-
-  let apiKey = '';
-  if (found.apiKeyEnv && process.env[found.apiKeyEnv]) {
-    apiKey = process.env[found.apiKeyEnv];
-  } else {
-    const credPath = path.join(process.env.HOME || '', '.dsh/.credentials.yaml');
-    if (fs.existsSync(credPath)) {
-      try {
-        const credText = fs.readFileSync(credPath, 'utf8');
-        const match = credText.match(new RegExp(`${found.apiKeyEnv || providerKey}:\\s*([^\\n\\r]+)`));
-        if (match) apiKey = match[1].trim().replace(/^['"]|['"]$/g, '');
-      } catch {}
-    }
-  }
-
-  if (!apiKey) {
-    if (providerKey === 'cpa') apiKey = 'sk-cpa-local';
-    else if (providerKey === 'workbuddypanel') apiKey = 'dummy';
-  }
-
+  let apiKey = readCredential(provider.apiKeyEnv);
+  if (!apiKey && provider.id === 'cpa') apiKey = 'sk-cpa-local';
   return {
-    baseURL: found.baseURL || 'http://127.0.0.1:8317/v1',
+    baseURL: (provider.baseURL || 'http://127.0.0.1:8317/v1').replace(/\/+$/, ''),
     apiKey
   };
 }
 
-/**
- * 解析当前有效工作区根目录
- */
-function resolveCurrentWorkspace(cwdOverride) {
-  if (cwdOverride && cwdOverride !== '/' && cwdOverride !== process.env.HOME) {
-    return cwdOverride;
-  }
-  return '/Volumes/ssd/Library/deepseek/pro';
+/* ------------------------------------------------------------------ *
+ * Workspace resolution — never guess through process.cwd().
+ * ------------------------------------------------------------------ */
+
+function sessionCwd(ctx, sessionId) {
+  try {
+    if (!sessionId) return undefined;
+    const session = ctx?.sessions?.get?.(sessionId);
+    const cwd = session?.header?.cwd;
+    if (typeof cwd === 'string' && cwd) return cwd;
+  } catch {}
+  return undefined;
 }
 
-/**
- * 将 DSH messages 转换为 OpenAI 兼容格式，完整支持 system, developer, user, assistant, tool 消息
- */
-function convertMessagesToOpenAI(messages, system) {
-  const result = [];
-  if (system && typeof system === 'string' && system.trim()) {
-    result.push({ role: 'system', content: system.trim() });
-  }
-
-  for (const msg of messages || []) {
-    let content = '';
-    const toolCalls = [];
-
-    if (typeof msg.content === 'string') {
-      content = msg.content;
-    } else if (Array.isArray(msg.content)) {
-      const parts = [];
-      for (const part of msg.content) {
-        if (part.type === 'text') parts.push(part.text);
-        else if (part.type === 'tool-call') {
-          toolCalls.push({
-            id: String(part.id || ''),
-            type: 'function',
-            function: {
-              name: part.name || '',
-              arguments: typeof part.arguments === 'string' ? part.arguments : JSON.stringify(part.arguments || {})
-            }
-          });
-        }
-      }
-      content = parts.join('\n');
+function defaultWorkspace() {
+  try {
+    const file = path.join(dshHome(), 'storages', 'workspace.json');
+    if (fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const id = data?.global?.defaultWorkspaceId;
+      const dir = data?.tables?.workspaces?.[id]?.path;
+      if (typeof dir === 'string' && dir) return dir;
     }
-
-    if (msg.role === 'developer' || msg.role === 'system') {
-      result.push({ role: 'system', content });
-    } else if (msg.role === 'user') {
-      result.push({ role: 'user', content });
-    } else if (msg.role === 'assistant') {
-      const assistantMsg = { role: 'assistant', content: content || '' };
-      if (toolCalls.length > 0) {
-        assistantMsg.tool_calls = toolCalls;
-      }
-      result.push(assistantMsg);
-    } else if (msg.role === 'tool') {
-      // 提取 tool call id
-      const callId = msg.toolCallId || msg.source?.callId || '';
-      result.push({
-        role: 'tool',
-        tool_call_id: String(callId),
-        content: content || ''
-      });
-    }
-  }
-
-  return result;
+  } catch {}
+  return process.cwd();
 }
 
-/**
- * 转换 DSH options.tools 到 OpenAI 兼容工具定义
- */
-function convertToolsToOpenAI(tools) {
+function resolveWorkspace(ctx, sessionId) {
+  return sessionCwd(ctx, sessionId) || defaultWorkspace();
+}
+
+/* ------------------------------------------------------------------ *
+ * Message / tool conversion.
+ * ------------------------------------------------------------------ */
+
+function flattenContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(part => part && part.type === 'text')
+    .map(part => part.text || '')
+    .join('\n');
+}
+
+function convertMessages(messages, system) {
+  const out = [];
+  if (typeof system === 'string' && system.trim()) out.push({ role: 'system', content: system.trim() });
+
+  for (const message of messages || []) {
+    const text = flattenContent(message?.content);
+    const toolCalls = Array.isArray(message?.content)
+      ? message.content.filter(p => p && p.type === 'tool-call').map(p => ({
+          id: String(p.id || ''),
+          type: 'function',
+          function: {
+            name: p.name || '',
+            arguments: typeof p.arguments === 'string' ? p.arguments : JSON.stringify(p.arguments ?? {})
+          }
+        }))
+      : [];
+
+    switch (message?.role) {
+      case 'developer':
+      case 'system':
+        out.push({ role: 'system', content: text });
+        break;
+      case 'user':
+        out.push({ role: 'user', content: text });
+        break;
+      case 'assistant': {
+        const entry = { role: 'assistant', content: text || '' };
+        const calls = toolCalls.length > 0 ? toolCalls : (Array.isArray(message.toolCalls) ? message.toolCalls : []);
+        if (calls.length > 0) entry.tool_calls = calls;
+        out.push(entry);
+        break;
+      }
+      case 'tool':
+        out.push({
+          role: 'tool',
+          tool_call_id: String(message.toolCallId || message.source?.callId || ''),
+          content: text || ''
+        });
+        break;
+      default:
+        break;
+    }
+  }
+  return out;
+}
+
+function convertTools(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
-  return tools.map(t => ({
+  return tools.map(tool => ({
     type: 'function',
     function: {
-      name: t.name,
-      description: t.description || '',
-      parameters: t.parameters || { type: 'object', properties: {} }
+      name: tool.name,
+      description: tool.description || '',
+      parameters: tool.parameters || { type: 'object', properties: {} }
     }
   }));
 }
 
-/**
- * 执行绘画链路的核心逻辑
- */
-async function executePaintingChain(chainConfig, userPrompt, workspaceCwd) {
-  if (!userPrompt || !userPrompt.trim()) {
-    throw new Error('绘画要求不能为空！');
+/* ------------------------------------------------------------------ *
+ * Prompt cleanup.
+ * ------------------------------------------------------------------ */
+
+function cleanGeneratedPrompt(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let text = raw.trim();
+
+  const quoted = text.match(/^\s*>\s*([\s\S]+)$/m);
+  const quoteLines = text.match(/^>\s*(.+)$/gm);
+  if (quoteLines && quoteLines.length > 0) {
+    const merged = quoteLines.map(line => line.replace(/^>\s*/, '').trim()).join(' ');
+    if (merged.length > 30) text = merged;
+  } else if (quoted && quoted[1] && quoted[1].trim().length > 30) {
+    text = quoted[1].trim();
+  } else {
+    const afterHeader = text.match(/(?:core\s+)?(?:image\s+)?prompt[：:]\s*\n+([\s\S]+?)(?:\n+---|\n+###|\n+中文|$)/i);
+    if (afterHeader && afterHeader[1].trim().length > 20) text = afterHeader[1].trim();
   }
 
-  const imageConf = chainConfig.imageConfig || {};
-  const effectiveWorkspace = resolveCurrentWorkspace(workspaceCwd);
-  const promptEndpoint = resolveProviderEndpoint(imageConf.promptModelProvider || 'cpa');
-  const imageEndpoint = resolveProviderEndpoint(imageConf.imageModelProvider || 'cpa');
+  text = text.replace(/^```[a-z]*\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+  text = text.replace(/^\*\*([\s\S]+)\*\*$/m, '$1').trim();
+  text = text.replace(/^(image\s+)?prompt:\s*/i, '').trim();
+  text = text.replace(/^\*\*|\*\*$/g, '').trim();
+  if ((text.startsWith('"') && text.endsWith('"')) ||
+      (text.startsWith("'") && text.endsWith("'")) ||
+      (text.startsWith('`') && text.endsWith('`'))) {
+    text = text.slice(1, -1).trim();
+  }
+  return text;
+}
 
-  const defaultInstruction = 'You are an expert AI image prompt engineer. Convert the user\'s drawing request into an exquisite, highly-detailed English prompt for image generation. CRITICAL REQUIREMENT: Output ONLY the final raw English prompt. Do NOT include greetings, intro phrases, markdown headers, Chinese translations, notes, or bullet points. Start immediately with the descriptive image prompt.';
-  const systemPrompt = imageConf.promptSystemInstruction
-    ? `${imageConf.promptSystemInstruction}\n\nCRITICAL REQUIREMENT: Output ONLY the raw descriptive English prompt without any pleasantries, intros, Chinese translations or markdown headers.`
-    : defaultInstruction;
+/* ------------------------------------------------------------------ *
+ * Painting chain.
+ * ------------------------------------------------------------------ */
 
-  // 1. 调用模型 A 生成精美英文生图提示词
-  const promptAUrl = `${promptEndpoint.baseURL.replace(/\/+$/, '')}/chat/completions`;
-  const responseA = await fetch(promptAUrl, {
+/** Chat markdown only resolves IMAGE destinations that are absolute paths (fileMediaUrl). */
+function markdownPath(workspace, file) {
+  return encodeURI(file);
+}
+
+async function callJson(url, apiKey, body, signal) {
+  const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${promptEndpoint.apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: imageConf.promptModelId || 'gemini-3.8-flash-high',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`响应不是合法 JSON: ${text.slice(0, 200)}`);
+  }
+}
+
+async function executePaintingChain(chain, userPrompt, workspace, options = {}) {
+  if (!userPrompt || !userPrompt.trim()) throw new Error('绘画要求不能为空。');
+
+  const conf = chain.imageConfig || {};
+  const promptEndpoint = resolveEndpoint(conf.promptModelProvider || 'cpa');
+  const imageEndpoint = resolveEndpoint(conf.imageModelProvider || 'cpa');
+  const signal = options.signal;
+
+  const instruction = typeof conf.promptSystemInstruction === 'string' && conf.promptSystemInstruction.trim()
+    ? conf.promptSystemInstruction.trim()
+    : DEFAULT_PROMPT_INSTRUCTION;
+
+  const a = await callJson(
+    `${promptEndpoint.baseURL}/chat/completions`,
+    promptEndpoint.apiKey,
+    {
+      model: conf.promptModelId || 'gemini-3.8-flash-high',
       messages: [
-        { role: 'system', content: systemPrompt },
+        {
+          role: 'system',
+          content: `${instruction}\n\nCRITICAL: output ONLY the raw descriptive English prompt. No greetings, no headers, no Chinese translation, no bullet list, no code fence.`
+        },
         { role: 'user', content: userPrompt.trim() }
       ],
       temperature: 0.7
-    })
-  });
-
-  if (!responseA.ok) {
-    const errorText = await responseA.text();
-    throw new Error(`[提示词模型A(${imageConf.promptModelId}) 生成失败 HTTP ${responseA.status}]: ${errorText}`);
-  }
-
-  const dataA = await responseA.json();
-  const rawGeneratedPrompt = dataA.choices?.[0]?.message?.content;
-  const finalPrompt = cleanGeneratedPrompt(rawGeneratedPrompt);
-
-  if (!finalPrompt) {
-    throw new Error(`模型A未能返回有效的提示词内容。响应: ${JSON.stringify(dataA).slice(0, 300)}`);
-  }
-
-  // 2. 将模型 A 产出的最终提示词喂给模型 B（确保带明确生图指令）
-  const promptLower = finalPrompt.toLowerCase();
-  const imageRequestPrompt = (promptLower.startsWith('generate an image') || promptLower.startsWith('draw an image') || promptLower.startsWith('create an image'))
-    ? finalPrompt
-    : `Generate an image: ${finalPrompt}`;
-
-  const imageBUrl = `${imageEndpoint.baseURL.replace(/\/+$/, '')}/chat/completions`;
-  const responseB = await fetch(imageBUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${imageEndpoint.apiKey}`,
-      'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      model: imageConf.imageModelId || 'gemini-3.1-flash-image',
-      messages: [
-        { role: 'user', content: imageRequestPrompt }
-      ]
-    })
-  });
+    signal
+  );
 
-  if (!responseB.ok) {
-    const errorText = await responseB.text();
-    throw new Error(`[绘画模型B(${imageConf.imageModelId}) 绘图失败 HTTP ${responseB.status}]: ${errorText}`);
-  }
+  const generated = cleanGeneratedPrompt(a?.choices?.[0]?.message?.content);
+  if (!generated) throw new Error('提示词模型未返回可用提示词。');
 
-  const dataB = await responseB.json();
-  const messageB = dataB.choices?.[0]?.message;
+  const request = /^(generate|draw|create)\s+an?\s+image/i.test(generated)
+    ? generated
+    : `Generate an image: ${generated}`;
 
-  // 3. 从模型 B 的响应中解析图片 Base64
-  let imageBase64Data = null;
+  const b = await callJson(
+    `${imageEndpoint.baseURL}/chat/completions`,
+    imageEndpoint.apiKey,
+    { model: conf.imageModelId || 'gemini-3.1-flash-image', messages: [{ role: 'user', content: request }] },
+    signal
+  );
+
+  const message = b?.choices?.[0]?.message;
+  let base64 = null;
   let ext = 'jpg';
 
-  if (messageB && Array.isArray(messageB.images) && messageB.images.length > 0) {
-    const firstImg = messageB.images[0];
-    const rawUrl = typeof firstImg === 'string' ? firstImg : (firstImg.image_url?.url || firstImg.url || '');
-    if (rawUrl.startsWith('data:image/')) {
-      const match = rawUrl.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
-      if (match) {
-        ext = match[1] === 'jpeg' ? 'jpg' : match[1];
-        imageBase64Data = match[2];
-      }
-    } else if (rawUrl.length > 100) {
-      imageBase64Data = rawUrl;
-    }
-  } else if (messageB && typeof messageB.content === 'string') {
-    const match = messageB.content.match(/data:image\/([a-zA-Z0-9]+);base64,([A-Za-z0-9+/=]+)/);
-    if (match) {
-      ext = match[1] === 'jpeg' ? 'jpg' : match[1];
-      imageBase64Data = match[2];
+  const candidates = [];
+  if (Array.isArray(message?.images)) {
+    for (const image of message.images) {
+      candidates.push(typeof image === 'string' ? image : (image?.image_url?.url || image?.url || ''));
     }
   }
+  if (typeof message?.content === 'string') candidates.push(message.content);
 
-  if (!imageBase64Data) {
-    throw new Error(`模型B已响应，但未能解析出图像数据。返回响应结构: ${JSON.stringify(dataB).slice(0, 300)}`);
+  for (const raw of candidates) {
+    if (typeof raw !== 'string' || raw.length < 64) continue;
+    const dataUrl = raw.match(/data:image\/([A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)/);
+    if (dataUrl) {
+      ext = dataUrl[1].toLowerCase() === 'jpeg' ? 'jpg' : dataUrl[1].toLowerCase();
+      base64 = dataUrl[2].replace(/\s+/g, '');
+      break;
+    }
+    if (/^[A-Za-z0-9+/=]{512,}$/.test(raw.trim())) {
+      base64 = raw.trim();
+      break;
+    }
   }
 
-  // 4. 保存图片到本地工作区
-  const saveDirName = imageConf.saveDirectory || 'images/generated';
-  const targetDir = path.isAbsolute(saveDirName)
-    ? saveDirName
-    : path.join(effectiveWorkspace, saveDirName);
-
-  if (!fs.existsSync(targetDir)) {
-    fs.mkdirSync(targetDir, { recursive: true });
+  if (!base64) {
+    const hint = typeof message?.content === 'string' ? message.content.slice(0, 200) : '';
+    throw new Error(`绘画模型未返回图像数据${hint ? `（它说：${hint}）` : ''}。`);
   }
 
-  const timestamp = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 14);
-  const randomSuffix = crypto.randomBytes(3).toString('hex');
-  const fileName = `img_${timestamp}_${randomSuffix}.${ext}`;
-  const absoluteFilePath = path.join(targetDir, fileName);
+  const dir = conf.saveDirectory || 'images/generated';
+  const target = path.isAbsolute(dir) ? dir : path.join(workspace, dir);
+  fs.mkdirSync(target, { recursive: true });
 
-  const imageBuffer = Buffer.from(imageBase64Data, 'base64');
-  fs.writeFileSync(absoluteFilePath, imageBuffer);
-
-  const relativePath = path.relative(effectiveWorkspace, absoluteFilePath);
-  const dataUrl = `data:image/${ext === 'jpg' ? 'jpeg' : ext};base64,${imageBase64Data}`;
+  const stamp = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 14);
+  const file = path.join(target, `img_${stamp}_${crypto.randomBytes(3).toString('hex')}.${ext}`);
+  const buffer = Buffer.from(base64, 'base64');
+  fs.writeFileSync(file, buffer);
 
   return {
-    success: true,
-    userPrompt,
-    generatedPrompt: finalPrompt,
-    absoluteFilePath,
-    relativePath,
-    dataUrl,
-    sizeBytes: imageBuffer.length,
-    modelA: imageConf.promptModelId || 'gemini-3.8-flash-high',
-    modelB: imageConf.imageModelId || 'gemini-3.1-flash-image'
+    generatedPrompt: generated,
+    absoluteFilePath: file,
+    relativePath: path.relative(workspace, file),
+    markdownPath: markdownPath(workspace, file),
+    sizeBytes: buffer.length,
+    modelA: conf.promptModelId || 'gemini-3.8-flash-high',
+    modelB: conf.imageModelId || 'gemini-3.1-flash-image'
   };
 }
 
-/**
- * 结构对齐的纯 JS 适配器类，完全不依赖提前 require('@deepseek-ai/dsh-llm')，避免冷启动竞赛
- */
-class FreeChainAdapterImpl {
-  constructor(configGetter) {
-    this.getConfig = configGetter;
+/* ------------------------------------------------------------------ *
+ * SSE plumbing.
+ * ------------------------------------------------------------------ */
+
+async function* sseEvents(reader, signal) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    if (signal?.aborted) throw new Error('请求已取消');
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let index;
+    while ((index = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, index).trim();
+      buffer = buffer.slice(index + 1);
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') return;
+      if (!payload) continue;
+      try {
+        yield JSON.parse(payload);
+      } catch {}
+    }
+  }
+}
+
+function deltaHasContent(delta) {
+  if (!delta) return false;
+  if (typeof delta.content === 'string' && delta.content.length > 0) return true;
+  if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) return true;
+  return Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
+}
+
+function retriableStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+/* ------------------------------------------------------------------ *
+ * Adapter.
+ * ------------------------------------------------------------------ */
+
+class FreeChainAdapter {
+  constructor(getConfig, ctx) {
+    this.getConfig = getConfig;
+    this.ctx = ctx;
   }
 
   providerInfo(provider) {
-    return {
-      id: provider,
-      name: '自由模型链路 (Chain)'
-    };
+    return { id: provider, name: '🔗 自由模型链路' };
   }
 
-  providerRetryPolicy(_provider) {
+  providerRetryPolicy() {
     return undefined;
   }
 
-  imageRequestPricing(_provider, _model) {
+  imageRequestPricing() {
     return undefined;
   }
 
   listModels(provider) {
-    const config = this.getConfig();
-    const chains = (config.chains || []).filter(c => c.enabled !== false);
-
+    const chains = (this.getConfig().chains || []).filter(chain => chain.enabled !== false);
     return Promise.resolve(chains.map(chain => {
-      let displayName = '';
-      let desc = '';
-
       if (chain.type === 'image') {
-        const ic = chain.imageConfig || {};
-        displayName = `🎨 [绘图] ${chain.name} (${ic.promptModelId || 'prompt'} ➔ ${ic.imageModelId || 'image'})`;
-        desc = `双模型绘画链路：模型A自动扩写提示词，模型B(${ic.imageModelId})渲染出图`;
-      } else {
-        const cc = chain.chatConfig || {};
-        const modelNames = (cc.models || []).map(m => m.model).join(' ➔ ');
-        displayName = `⚡️ [对话] ${chain.name} (${modelNames || '无模型'})`;
-        desc = `高可用容灾对话链路：重试${cc.maxRetriesPerModel || 5}次自动按序轮转候选模型，保障对话不中断`;
+        const conf = chain.imageConfig || {};
+        return {
+          provider,
+          id: chain.id,
+          name: `🎨 [绘图] ${chain.name} (${conf.promptModelId || '提示词'} ➔ ${conf.imageModelId || '绘图'})`,
+          description: '双模型绘画链路：模型 A 扩写提示词，模型 B 渲染出图'
+        };
       }
-
+      const conf = chain.chatConfig || {};
+      const order = (conf.models || []).map(m => m.model).join(' ➔ ');
       return {
         provider,
         id: chain.id,
-        name: displayName,
-        description: desc
+        name: `⚡️ [对话] ${chain.name} (${order || '未配置模型'})`,
+        description: `容灾对话链路：单模型重试 ${conf.maxRetriesPerModel || 5} 次，失败后按序切换下一模型`
       };
     }));
   }
 
   resolveModel(provider, model) {
-    const config = this.getConfig();
-    const chain = (config.chains || []).find(c => c.id === model);
-
+    const chain = (this.getConfig().chains || []).find(item => item.id === model);
     let name = `自由链路 (${model})`;
     if (chain) {
       if (chain.type === 'image') {
-        const ic = chain.imageConfig || {};
-        name = `🎨 [绘图] ${chain.name} (${ic.promptModelId} ➔ ${ic.imageModelId})`;
+        const conf = chain.imageConfig || {};
+        name = `🎨 [绘图] ${chain.name} (${conf.promptModelId} ➔ ${conf.imageModelId})`;
       } else {
-        const cc = chain.chatConfig || {};
-        const modelNames = (cc.models || []).map(m => m.model).join(' ➔ ');
-        name = `⚡️ [对话] ${chain.name} (${modelNames})`;
+        const conf = chain.chatConfig || {};
+        name = `⚡️ [对话] ${chain.name} (${(conf.models || []).map(m => m.model).join(' ➔ ')})`;
       }
     }
-
     return Promise.resolve({
       provider,
       id: model,
@@ -483,503 +564,470 @@ class FreeChainAdapterImpl {
   async prepareCall(provider, model, signal) {
     return {
       model: await this.resolveModel(provider, model, signal),
-      stream: (options) => this.stream(options)
+      stream: options => this.stream(options)
     };
   }
 
   async *stream(options) {
-    const config = this.getConfig();
-    const chainId = options.model;
-    const chain = (config.chains || []).find(c => c.id === chainId);
-
+    const chain = (this.getConfig().chains || []).find(item => item.id === options.model);
     if (!chain) {
+      const text = `❌ 未找到 id 为 \`${options.model}\` 的链路，请到「设置 → 🔗 模型自由链路设置」检查。`;
       yield { type: 'block-start', index: 0, blockType: 'text' };
-      yield { type: 'text-delta', index: 0, text: `❌ 未找到 ID 为 "${chainId}" 的链路配置，请检查设置。` };
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: `未找到链路配置` } };
+      yield { type: 'text-delta', index: 0, text };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
-
     if (chain.type === 'image') {
       yield* this.streamImageChain(chain, options);
     } else {
-      yield* this.streamResilientChatChain(chain, options);
+      yield* this.streamChatChain(chain, options);
     }
   }
 
   async *streamImageChain(chain, options) {
-    const cwd = process.cwd();
+    const workspace = resolveWorkspace(this.ctx, options.sessionId);
     const messages = options.messages || [];
-    let userPrompt = '';
+    let prompt = '';
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg.role === 'user') {
-        if (typeof msg.content === 'string') userPrompt = msg.content;
-        else if (Array.isArray(msg.content)) {
-          userPrompt = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-        }
+      if (messages[i]?.role === 'user') {
+        prompt = flattenContent(messages[i].content);
         break;
       }
     }
-    if (!userPrompt.trim()) userPrompt = '画一只可爱的蓝白小鲸鱼';
+    if (!prompt.trim()) prompt = '一只可爱的蓝白小鲸鱼';
+
+    const conf = chain.imageConfig || {};
+    const header = `🎨 **绘画链路「${chain.name}」**\n\n` +
+      `* 模型 A（提示词）：\`${conf.promptModelProvider || 'cpa'} / ${conf.promptModelId || '—'}\`\n` +
+      `* 模型 B（绘图）：\`${conf.imageModelProvider || 'cpa'} / ${conf.imageModelId || '—'}\`\n\n`;
 
     yield { type: 'block-start', index: 0, blockType: 'text' };
+    yield { type: 'text-delta', index: 0, text: `${header}⏳ 正在生成提示词并绘制...\n` };
 
-    const ic = chain.imageConfig || {};
-    const prefix = `🎨 **绘画链路 [${chain.name}] 已启动！**\n\n` +
-      `* **模型 A（提示词扩写）**：\`${ic.promptModelProvider} / ${ic.promptModelId}\`\n` +
-      `* **模型 B（后端绘画）**：\`${ic.imageModelProvider} / ${ic.imageModelId}\`\n\n` +
-      `⏳ 正在分析需求并生成精美提示词...\n`;
-
-    yield { type: 'text-delta', index: 0, text: prefix };
-
-    let result;
+    let text = `${header}⏳ 正在生成提示词并绘制...\n`;
     try {
-      result = await executePaintingChain(chain, userPrompt, cwd);
-    } catch (err) {
-      const errText = `\n❌ **绘画链路执行失败**：\n> ${err.message}\n`;
-      yield { type: 'text-delta', index: 0, text: errText };
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: prefix + errText } };
-      yield { type: 'usage', usage: { inputTokens: 50, outputTokens: 100 } };
-      yield { type: 'finish', reason: { kind: 'stop' } };
-      return;
+      const result = await executePaintingChain(chain, prompt, workspace, { signal: options.signal });
+      const tail =
+        `\n✅ **完成**\n\n` +
+        `**扩写后的提示词**\n\n> ${result.generatedPrompt.replace(/\n/g, '\n> ')}\n\n` +
+        `![生成的绘画作品](${result.markdownPath})\n\n` +
+        `📁 \`${result.relativePath}\` (${Math.round(result.sizeBytes / 1024)} KB)\n`;
+      text += tail;
+      yield { type: 'text-delta', index: 0, text: tail };
+    } catch (error) {
+      const message = typeof error?.message === 'string' ? error.message : String(error);
+      const tail = `\n❌ **绘画失败**：${message}\n`;
+      text += tail;
+      yield { type: 'text-delta', index: 0, text: tail };
     }
 
-    // 同时提供三种路径以确保 100% 在任何环境下（流式渲染中、落定渲染后、相对路径解析器）直接内嵌可视预览：
-    // 1. 相对路径形式（MarkdownText 依靠 fileImages/cwd 解析落定预览）
-    // 2. 内联 Data URL（base64 直接作为图片源，浏览器与 Markdown 引擎无条件秒开，绝对不会显示裂图或空框）
-    const resultDelta = `\n✨ **模型 A 扩写的高精生图提示词**：\n` +
-      `> ${result.generatedPrompt}\n\n` +
-      `🖼️ **模型 B (${result.modelB}) 绘制结果**：\n\n` +
-      `![生成的绘画作品](${result.dataUrl})\n\n` +
-      `📁 **文件已保存到工作区**：[\`${result.relativePath}\`](<${result.relativePath}>) (${Math.round(result.sizeBytes / 1024)} KB)\n`;
-
-    yield { type: 'text-delta', index: 0, text: resultDelta };
-    const fullText = prefix + resultDelta;
-
-    yield { type: 'block-end', index: 0, block: { type: 'text', text: fullText } };
-    yield {
-      type: 'usage',
-      usage: {
-        inputTokens: Math.round(userPrompt.length / 2),
-        outputTokens: Math.round(fullText.length / 2)
-      }
-    };
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+    yield { type: 'usage', usage: { inputTokens: Math.max(1, Math.round(prompt.length / 3)), outputTokens: Math.max(1, Math.round(text.length / 3)) } };
     yield { type: 'finish', reason: { kind: 'stop' } };
   }
 
-  async *streamResilientChatChain(chain, options) {
-    const cc = chain.chatConfig || {};
-    const candidateModels = (cc.models || []).slice(0, 8);
-    const maxRetries = Math.max(1, cc.maxRetriesPerModel || 5);
+  async *streamChatChain(chain, options) {
+    const conf = chain.chatConfig || {};
+    const candidates = (Array.isArray(conf.models) ? conf.models : [])
+      .filter(item => item && item.provider && item.model)
+      .slice(0, 8);
+    const attempts = Math.min(10, Math.max(1, Number(conf.maxRetriesPerModel) || 5));
 
-    if (candidateModels.length === 0) {
+    if (candidates.length === 0) {
+      const text = `⚠️ 链路「${chain.name}」还没有配置任何模型，请到设置里添加。`;
       yield { type: 'block-start', index: 0, blockType: 'text' };
-      yield { type: 'text-delta', index: 0, text: `⚠️ 对话链路 [${chain.name}] 未配置任何候选模型节点！` };
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: `未配置候选模型` } };
+      yield { type: 'text-delta', index: 0, text };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
 
-    const openAiMessages = convertMessagesToOpenAI(options.messages, options.system);
-    const openAiTools = convertToolsToOpenAI(options.tools);
+    const messages = convertMessages(options.messages, options.system);
+    const tools = convertTools(options.tools);
+    const failures = [];
 
-    let activeStreamChunks = null;
-    let successfulModel = null;
-    const failuresLog = [];
+    for (let index = 0; index < candidates.length; index++) {
+      const candidate = candidates[index];
+      const endpoint = resolveEndpoint(candidate.provider);
+      const label = `${candidate.provider} / ${candidate.model}`;
+      let lastError = '';
 
-    // 串行轮询每个候选模型
-    for (let modelIndex = 0; modelIndex < candidateModels.length; modelIndex++) {
-      const candidate = candidateModels[modelIndex];
-      const modelDisplayName = `${candidate.provider} / ${candidate.model}`;
-      const endpoint = resolveProviderEndpoint(candidate.provider);
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        options.signal?.addEventListener?.('abort', onAbort, { once: true });
+        let timer;
 
-      let modelSucceeded = false;
-      let lastModelError = '';
-
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const streamUrl = `${endpoint.baseURL.replace(/\/+$/, '')}/chat/completions`;
-          const reqBody = {
+          const body = {
             model: candidate.model,
-            messages: openAiMessages,
-            temperature: options.temperature ?? 0.7,
-            stream: true
+            messages,
+            stream: true,
+            temperature: options.temperature ?? 0.7
           };
-          if (openAiTools && openAiTools.length > 0) {
-            reqBody.tools = openAiTools;
-          }
+          if (options.maxTokens) body.max_tokens = options.maxTokens;
+          if (tools) body.tools = tools;
 
-          const response = await fetch(streamUrl, {
+          timer = setTimeout(() => controller.abort(), 90_000);
+          const response = await fetch(`${endpoint.baseURL}/chat/completions`, {
             method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${endpoint.apiKey}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(reqBody)
+            headers: { Authorization: `Bearer ${endpoint.apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: controller.signal
           });
 
           if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText.slice(0, 150)}`);
+            const detail = (await response.text()).slice(0, 200);
+            const error = new Error(`HTTP ${response.status}: ${detail}`);
+            error.retriable = retriableStatus(response.status);
+            throw error;
           }
+          if (!response.body) throw new Error('响应没有可读流');
 
-          if (!response.body) {
-            throw new Error('Response body stream is empty');
-          }
-
-          // 读取该流全部事件并验证是否为有效流（非空、非 malformed_function_call）
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let streamBuffer = '';
-          const collectedEvents = [];
+          const events = sseEvents(response.body.getReader(), controller.signal);
+          const iterator = events[Symbol.asyncIterator]();
+          const buffered = [];
+          let meaningful = false;
           let finishReason = null;
-          let hasMeaningfulContent = false;
-          let isDone = false;
 
-          while (!isDone) {
-            const { value, done } = await reader.read();
-            if (done) break;
-
-            streamBuffer += decoder.decode(value, { stream: true });
-            const lines = streamBuffer.split('\n');
-            streamBuffer = lines.pop() || '';
-
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data:')) continue;
-              if (trimmed === 'data: [DONE]') {
-                isDone = true;
-                break;
-              }
-
-              try {
-                const json = JSON.parse(trimmed.slice(5).trim());
-                collectedEvents.push(json);
-
-                const choice = json.choices?.[0];
-                if (choice) {
-                  if (choice.finish_reason) finishReason = choice.finish_reason;
-                  const delta = choice.delta;
-                  if (delta) {
-                    if (typeof delta.content === 'string' && delta.content.length > 0) {
-                      hasMeaningfulContent = true;
-                    }
-                    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-                      hasMeaningfulContent = true;
-                    }
-                  }
-                }
-              } catch {}
+          // Peek with an explicit iterator: breaking a `for await` would call
+          // iterator.return() and close the very stream we still need to read.
+          while (true) {
+            const step = await iterator.next();
+            if (step.done) break;
+            const event = step.value;
+            buffered.push(event);
+            const choice = event?.choices?.[0];
+            if (choice?.finish_reason) finishReason = choice.finish_reason;
+            if (deltaHasContent(choice?.delta)) {
+              meaningful = true;
+              break;
             }
           }
+          clearTimeout(timer);
+          timer = undefined;
 
-          // 核心容灾拦截：如果上游返回了 malformed_function_call、或者内容为空字符串、或者没有产出任何文本与tool_calls，判定为该模型不可用，切换下一跳！
-          if (finishReason === 'malformed_function_call') {
-            throw new Error('上游模型返回 malformed_function_call (畸形工具调用)');
-          }
-          if (!hasMeaningfulContent) {
-            throw new Error(`模型响应为空流 (finish_reason: ${finishReason || 'unknown'})`);
+          if (!meaningful) {
+            await iterator.return?.();
+            if (finishReason === 'malformed_function_call') {
+              throw new Error('上游返回 malformed_function_call（畸形工具调用）');
+            }
+            throw new Error(`上游返回空响应（finish_reason: ${finishReason || 'unknown'}）`);
           }
 
-          // 该模型成功产生有效流！
-          activeStreamChunks = collectedEvents;
-          successfulModel = candidate;
-          modelSucceeded = true;
-          break; // 退出当前模型的重试
-        } catch (err) {
-          lastModelError = err.message || '连接失败';
-          if (attempt < maxRetries) {
-            await new Promise(r => setTimeout(r, 600));
+          // Committed: this model answered, stream the rest live.
+          const state = {
+            textOpen: false,
+            reasoningOpen: false,
+            text: '',
+            toolBlocks: new Map(),
+            toolBuffers: new Map(),
+            hadToolCalls: false,
+            nextIndex: 0,
+            textIndex: 0,
+            reasoningIndex: 0
+          };
+
+          if (failures.length > 0) {
+            const note = `> ⚠️ 已自动切换：次序 ${index + 1} · \`${label}\`\n\n`;
+            state.textIndex = state.nextIndex++;
+            state.textOpen = true;
+            state.text += note;
+            yield { type: 'block-start', index: state.textIndex, blockType: 'text' };
+            yield { type: 'text-delta', index: state.textIndex, text: note };
           }
+
+          const emit = event => this.emitEvent(event, state);
+          for (const event of buffered) {
+            for (const chunk of emit(event)) yield chunk;
+          }
+          while (true) {
+            const step = await iterator.next();
+            if (step.done) break;
+            const event = step.value;
+            if (finishReason === null) {
+              const reason = event?.choices?.[0]?.finish_reason;
+              if (reason) finishReason = reason;
+            }
+            for (const chunk of emit(event)) yield chunk;
+          }
+
+          for (const chunk of this.closeBlocks(state)) yield chunk;
+
+          yield {
+            type: 'usage',
+            usage: {
+              inputTokens: Math.max(1, Math.round(JSON.stringify(messages).length / 4)),
+              outputTokens: Math.max(1, Math.round(state.text.length / 3))
+            }
+          };
+          yield { type: 'finish', reason: state.hadToolCalls ? { kind: 'tool-calls' } : { kind: 'stop' } };
+          return;
+        } catch (error) {
+          clearTimeout(timer);
+          lastError = error?.name === 'AbortError' ? '连接或首字超时' : (error?.message || String(error));
+          const retriable = error?.retriable !== false;
+          if (options.signal?.aborted) {
+            const text = `\n\n_已取消_\n`;
+            yield { type: 'block-start', index: 0, blockType: 'text' };
+            yield { type: 'text-delta', index: 0, text };
+            yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+            return;
+          }
+          if (!retriable) break;
+          if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, Math.min(400 * attempt, 1500)));
+        } finally {
+          options.signal?.removeEventListener?.('abort', onAbort);
         }
       }
 
-      if (modelSucceeded && activeStreamChunks) {
-        break; // 成功找到首个有效可用模型，停止向后探查
-      } else {
-        failuresLog.push({
-          model: modelDisplayName,
-          order: modelIndex + 1,
-          retries: maxRetries,
-          error: lastModelError
-        });
-      }
+      failures.push({ order: index + 1, label, error: lastError });
     }
 
-    if (!activeStreamChunks || !successfulModel) {
-      yield { type: 'block-start', index: 0, blockType: 'text' };
-      let failReport = `❌ **对话链路 [${chain.name}] 所有模型连接均已失败！**\n\n`;
-      failReport += `故障转移排查记录（每个模型已尝试 ${maxRetries} 次重试）：\n`;
-      for (const f of failuresLog) {
-        failReport += `* **[次序 ${f.order}]** \`${f.model}\`：重试${f.retries}次后失败（${f.error}）\n`;
-      }
-      failReport += `\n请检查网络、代理端口或各 Provider 的 API 状态。`;
+    const lines = [
+      `❌ **链路「${chain.name}」全部模型不可用**`,
+      '',
+      `每个模型最多尝试 ${attempts} 次：`,
+      ...failures.map(item => `* 次序 ${item.order} · \`${item.label}\` — ${item.error}`),
+      '',
+      '请检查网络、代理端口或各 Provider 的凭据。'
+    ];
+    const text = lines.join('\n');
+    yield { type: 'block-start', index: 0, blockType: 'text' };
+    yield { type: 'text-delta', index: 0, text };
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  }
 
-      yield { type: 'text-delta', index: 0, text: failReport };
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: failReport } };
-      yield { type: 'finish', reason: { kind: 'stop' } };
-      return;
+  emitEvent(event, state) {
+    const chunks = [];
+    const choice = event?.choices?.[0];
+    const delta = choice?.delta;
+    if (!delta) return chunks;
+
+    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+      if (!state.reasoningOpen) {
+        state.reasoningIndex = state.nextIndex++;
+        chunks.push({ type: 'block-start', index: state.reasoningIndex, blockType: 'reasoning' });
+        state.reasoningOpen = true;
+      }
+      chunks.push({ type: 'reasoning-delta', index: state.reasoningIndex, text: delta.reasoning_content });
     }
 
-    // 成功连接到某次序的模型，流式输出事件块
-    let blockIndex = 0;
-    let inTextBlock = false;
-    let fullOutputText = '';
-
-    // 如果发生了容灾切换，输出故障转移提示
-    if (failuresLog.length > 0) {
-      const switchNotice = `> ⚠️ **链路故障转移生效**：前置模型连接失败，上下文已无缝转移至 **次序 ${failuresLog.length + 1}：\`${successfulModel.provider} / ${successfulModel.model}\`**。\n\n`;
-      yield { type: 'block-start', index: blockIndex, blockType: 'text' };
-      yield { type: 'text-delta', index: blockIndex, text: switchNotice };
-      fullOutputText += switchNotice;
-      inTextBlock = true;
+    if (typeof delta.content === 'string' && delta.content) {
+      if (state.reasoningOpen) {
+        chunks.push({ type: 'block-end', index: state.reasoningIndex, block: { type: 'reasoning', text: '' } });
+        state.reasoningOpen = false;
+      }
+      if (!state.textOpen) {
+        state.textIndex = state.nextIndex++;
+        chunks.push({ type: 'block-start', index: state.textIndex, blockType: 'text' });
+        state.textOpen = true;
+      }
+      state.text += delta.content;
+      chunks.push({ type: 'text-delta', index: state.textIndex, text: delta.content });
     }
 
-    const toolCallBuffers = new Map(); // index -> { id, name, args }
-
-    for (const json of activeStreamChunks) {
-      const choice = json.choices?.[0];
-      if (!choice) continue;
-
-      const delta = choice.delta;
-      if (!delta) continue;
-
-      // 1. 处理思考内容 reasoning
-      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
-        yield { type: 'reasoning-delta', index: blockIndex, text: delta.reasoning_content };
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+      if (state.textOpen) {
+        chunks.push({ type: 'block-end', index: state.textIndex, block: { type: 'text', text: state.text } });
+        state.textOpen = false;
+      }
+      if (state.reasoningOpen) {
+        chunks.push({ type: 'block-end', index: state.reasoningIndex, block: { type: 'reasoning', text: '' } });
+        state.reasoningOpen = false;
       }
 
-      // 2. 处理正文文本 content
-      if (typeof delta.content === 'string' && delta.content.length > 0) {
-        if (!inTextBlock) {
-          yield { type: 'block-start', index: blockIndex, blockType: 'text' };
-          inTextBlock = true;
+      for (const call of delta.tool_calls) {
+        const key = call.index ?? 0;
+        if (!state.toolBuffers.has(key)) {
+          const buffer = {
+            id: call.id || `call_${Date.now().toString(36)}_${key}`,
+            name: call.function?.name || '',
+            arguments: ''
+          };
+          state.toolBuffers.set(key, buffer);
+          state.hadToolCalls = true;
+          const blockIndex = state.nextIndex++;
+          state.toolBlocks.set(key, blockIndex);
+          chunks.push({ type: 'block-start', index: blockIndex, blockType: 'tool-call' });
         }
-        fullOutputText += delta.content;
-        yield { type: 'text-delta', index: blockIndex, text: delta.content };
-      }
-
-      // 3. 处理工具调用 tool_calls
-      if (Array.isArray(delta.tool_calls)) {
-        if (inTextBlock) {
-          yield { type: 'block-end', index: blockIndex, block: { type: 'text', text: fullOutputText } };
-          inTextBlock = false;
-          blockIndex++;
-        }
-
-        for (const tc of delta.tool_calls) {
-          const tcIndex = tc.index ?? 0;
-          if (!toolCallBuffers.has(tcIndex)) {
-            const newTc = {
-              id: tc.id || `call_${Date.now()}_${tcIndex}`,
-              name: tc.function?.name || '',
-              arguments: ''
-            };
-            toolCallBuffers.set(tcIndex, newTc);
-            yield {
-              type: 'block-start',
-              index: blockIndex + tcIndex,
-              blockType: 'tool-call'
-            };
-          }
-
-          const existing = toolCallBuffers.get(tcIndex);
-          if (tc.id) existing.id = tc.id;
-          if (tc.function?.name) existing.name = tc.function.name;
-          const argDelta = tc.function?.arguments || '';
-          if (argDelta) {
-            existing.arguments += argDelta;
-            yield {
-              type: 'tool-call-delta',
-              index: blockIndex + tcIndex,
-              id: existing.id,
-              name: existing.name,
-              argumentsDelta: argDelta
-            };
-          }
+        const buffer = state.toolBuffers.get(key);
+        if (call.id) buffer.id = call.id;
+        if (call.function?.name) buffer.name = call.function.name;
+        const piece = call.function?.arguments || '';
+        if (piece) {
+          buffer.arguments += piece;
+          chunks.push({
+            type: 'tool-call-delta',
+            index: state.toolBlocks.get(key),
+            id: buffer.id,
+            name: buffer.name,
+            argumentsDelta: piece
+          });
         }
       }
     }
 
-    // 收尾关闭 text block
-    if (inTextBlock) {
-      yield { type: 'block-end', index: blockIndex, block: { type: 'text', text: fullOutputText } };
-      blockIndex++;
-    }
+    return chunks;
+  }
 
-    // 收尾关闭 tool-call blocks
-    for (const [tcIndex, tc] of toolCallBuffers.entries()) {
-      yield {
+  closeBlocks(state) {
+    const chunks = [];
+    if (state.textOpen) {
+      chunks.push({ type: 'block-end', index: state.textIndex, block: { type: 'text', text: state.text } });
+      state.textOpen = false;
+    }
+    if (state.reasoningOpen) {
+      chunks.push({ type: 'block-end', index: state.reasoningIndex, block: { type: 'reasoning', text: '' } });
+      state.reasoningOpen = false;
+    }
+    for (const [key, buffer] of state.toolBuffers) {
+      chunks.push({
         type: 'block-end',
-        index: blockIndex + tcIndex,
-        block: {
-          type: 'tool-call',
-          id: tc.id,
-          name: tc.name,
-          arguments: tc.arguments
-        }
-      };
+        index: state.toolBlocks.get(key),
+        block: { type: 'tool-call', id: buffer.id, name: buffer.name, arguments: buffer.arguments }
+      });
     }
-
-    yield {
-      type: 'usage',
-      usage: {
-        inputTokens: Math.round(JSON.stringify(openAiMessages).length / 3),
-        outputTokens: Math.max(1, Math.round(fullOutputText.length / 2))
-      }
-    };
-
-    const finalFinishReason = toolCallBuffers.size > 0 ? { kind: 'tool-calls' } : { kind: 'stop' };
-    yield { type: 'finish', reason: finalFinishReason };
+    state.toolBuffers.clear();
+    return chunks;
   }
 }
 
-/**
- * 插件的主激活函数
- */
+/* ------------------------------------------------------------------ *
+ * Plugin entry.
+ * ------------------------------------------------------------------ */
+
 export function apply(ctx, config) {
-  ctx.logger?.info('dsh-plugin-image-chain: 模型自由链路系统已加载');
+  const fromPatch = sanitizeChains(config?.chains);
+  const stored = loadPersistedChains();
+  const chains = stored || fromPatch || DEFAULT_CHAINS;
 
-  let currentConfig = {
-    chains: [
-      {
-        id: 'chain-default-image',
-        name: '默认绘画链路',
-        type: 'image',
-        enabled: true,
-        imageConfig: {
-          promptModelProvider: 'cpa',
-          promptModelId: 'gemini-3.8-flash-high',
-          imageModelProvider: 'cpa',
-          imageModelId: 'gemini-3.1-flash-image',
-          saveDirectory: 'images/generated'
-        }
-      },
-      {
-        id: 'chain-resilient-chat',
-        name: '高可用容灾对话链路',
-        type: 'chat',
-        enabled: true,
-        chatConfig: {
-          maxRetriesPerModel: 5,
-          models: [
-            { provider: 'cpa', model: 'gemini-3.8-flash-high' },
-            { provider: 'cpa', model: 'claude-sonnet-4-6' },
-            { provider: 'workbuddypanel', model: 'cn:deepseek-v4.1-flash' }
-          ]
-        }
-      }
-    ],
-    ...config
-  };
+  const currentConfig = { ...(config || {}), chains };
 
-  // 1. 向 LLM 注册适配器与 Provider，使得所有配置的链路作为原生可选模型出现在模型选择器中！
+  // First run (or a brand-new install): seed the store so later upgrades read it back.
+  if (!stored) savePersistedChains(chains);
+
+  ctx.logger.info(`[${BUILD}] chains ready: ${chains.length} item(s), store=${STORAGE_FILE}`);
+
   try {
-    const disposeConfigurable = ctx.llm.registerConfigurableProviders([{
+    const handle = ctx.llm.registerConfigurableProviders([{
       provider: 'image-chain',
       displayName: '🔗 自由模型链路',
       settingsNs: 'image-chain',
       settingsPath: []
     }]);
-    if (typeof disposeConfigurable === 'function') {
-      ctx.effect(() => disposeConfigurable);
-    }
-  } catch (err) {}
+    if (typeof handle === 'function') ctx.effect(() => handle);
+  } catch (error) {
+    ctx.logger.warn(`[${BUILD}] registerConfigurableProviders failed: ${error?.message}`);
+  }
 
-  const adapter = new FreeChainAdapterImpl(() => currentConfig);
+  let adapterHandle = null;
+  const adapter = new FreeChainAdapter(() => currentConfig, ctx);
   try {
-    const registration = ctx.llm.registerAdapter(['image-chain'], adapter);
-    if (typeof registration === 'function') {
-      ctx.effect(() => registration);
-    }
-  } catch (err) {}
+    adapterHandle = ctx.llm.registerAdapter(['image-chain'], adapter);
+    if (typeof adapterHandle === 'function') ctx.effect(() => adapterHandle);
+  } catch (error) {
+    ctx.logger.warn(`[${BUILD}] registerAdapter failed: ${error?.message}`);
+  }
 
-  // 2. 注册 Web HTTP 接口供前端设置面板自由管理所有链路
-  if (ctx.webServer && typeof ctx.webServer.register === 'function') {
-    const disposeRoute = ctx.webServer.register({
-      kind: 'exact',
-      path: '/api/image-chain/settings',
-      handler: async (req, res) => {
-        if (req.method === 'GET') {
-          const availableProviders = getAvailableProvidersAndModels();
-          res.writeHead(200, {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Access-Control-Allow-Origin': '*'
-          });
-          res.end(JSON.stringify({
-            ok: true,
-            currentConfig,
-            availableProviders
-          }));
-          return;
-        }
+  const settingsHandler = async (req, res) => {
+    const json = (status, payload) => {
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(payload));
+    };
 
-        if (req.method === 'POST') {
-          let bodyText = '';
-          req.on('data', c => bodyText += c);
-          req.on('end', () => {
-            try {
-              const payload = JSON.parse(bodyText || '{}');
-              if (Array.isArray(payload.chains)) {
-                currentConfig.chains = payload.chains;
-              }
-
-              res.writeHead(200, {
-                'Content-Type': 'application/json; charset=utf-8',
-                'Access-Control-Allow-Origin': '*'
-              });
-              res.end(JSON.stringify({ ok: true, currentConfig }));
-            } catch (err) {
-              res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(JSON.stringify({ ok: false, error: err.message }));
-            }
-          });
-          return;
-        }
-
-        res.writeHead(405);
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end();
+        return;
+      }
+      return json(200, {
+        ok: true,
+        build: BUILD,
+        storageFile: STORAGE_FILE,
+        currentConfig,
+        availableProviders: listProviders()
+      });
+    }
+
+    if (req.method !== 'POST') return json(405, { ok: false, error: 'Method Not Allowed' });
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const next = sanitizeChains(payload?.chains);
+        if (next === null) return json(400, { ok: false, error: 'chains 必须是非空数组，且每项都带 id' });
+
+        currentConfig.chains = next;
+        const saved = savePersistedChains(next);
+        if (!saved) return json(500, { ok: false, error: `无法写入 ${STORAGE_FILE}` });
+
+        // 热更新：通知 LLM 适配器与前端模型选择器即刻刷新可用模型列表！
+        try {
+          if (typeof adapterHandle?.replace === 'function') {
+            adapterHandle.replace(['image-chain']);
+          }
+        } catch (e) {
+          ctx.logger.warn(`[${BUILD}] adapter replace failed: ${e?.message}`);
+        }
+
+        try {
+          ctx.emit('llm/adapters-updated');
+        } catch (e) {
+          ctx.logger.warn(`[${BUILD}] emit adapters-updated failed: ${e?.message}`);
+        }
+
+        return json(200, { ok: true, build: BUILD, storageFile: STORAGE_FILE, currentConfig });
+      } catch (error) {
+        return json(500, { ok: false, error: error?.message || String(error) });
       }
     });
+  };
 
-    if (typeof disposeRoute === 'function') {
-      ctx.effect(() => disposeRoute);
+  for (const routePath of ['/api/image-chain/settings', '/api/always-connected/settings']) {
+    try {
+      const dispose = ctx.webServer.register({ kind: 'exact', path: routePath, handler: settingsHandler });
+      if (typeof dispose === 'function') ctx.effect(() => dispose);
+    } catch (error) {
+      ctx.logger.warn(`[${BUILD}] route ${routePath} failed: ${error?.message}`);
     }
   }
 
-  // 3. 注册保底 Agent Tool: chain_generate_image
   const disposeTool = ctx.tools.register({
     name: 'chain_generate_image',
-    description: '【AI绘画链路工具】模型A自动扩写生图提示词，随后无缝投喂给后端绘画模型生成高清图像并保存到本地。',
+    description: '用当前配置的绘画链路生成图像：先由提示词模型扩写，再交给绘图模型渲染，结果保存在当前工作区。',
     parameters: {
       type: 'object',
       required: ['requirement'],
       properties: {
-        requirement: { type: 'string', description: '绘画设想与画面描述' }
+        requirement: { type: 'string', description: '画面描述（自然语言即可）' }
       }
     },
     output: {
       schema: { type: 'object' },
-      render: (_args, val) => [{
+      render: (_args, value) => [{
         type: 'text',
-        text: `🎨 **绘画链路完成**：\n\n> 提示词：${val.generatedPrompt}\n\n![Image](${val.dataUrl})\n\n路径：[\`${val.relativePath}\`](<${val.relativePath}>)`
+        text: `🎨 已生成\n\n> ${String(value?.generatedPrompt || '').slice(0, 500)}\n\n![Image](${value?.markdownPath || ''})\n\n\`${value?.relativePath || ''}\``
       }]
     },
-    async execute(args) {
-      const defaultImgChain = (currentConfig.chains || []).find(c => c.type === 'image') || {
-        imageConfig: {
-          promptModelProvider: 'cpa',
-          promptModelId: 'gemini-3.8-flash-high',
-          imageModelProvider: 'cpa',
-          imageModelId: 'gemini-3.1-flash-image',
-          saveDirectory: 'images/generated'
-        }
+    async execute(args, exec) {
+      const chain = (currentConfig.chains || []).find(item => item.type === 'image')
+        || { name: '默认绘画链路', imageConfig: { saveDirectory: 'images/generated' } };
+      const workspace = exec?.agent?.session?.header?.cwd || defaultWorkspace();
+      const result = await executePaintingChain(chain, args.requirement, workspace);
+      return {
+        generatedPrompt: result.generatedPrompt,
+        markdownPath: result.markdownPath,
+        relativePath: result.relativePath,
+        sizeBytes: result.sizeBytes
       };
-      return await executePaintingChain(defaultImgChain, args.requirement, process.cwd());
     }
   });
-  if (typeof disposeTool === 'function') {
-    ctx.effect(() => disposeTool);
-  }
+  if (typeof disposeTool === 'function') ctx.effect(() => disposeTool);
 }

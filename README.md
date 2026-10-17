@@ -6,6 +6,32 @@
 
 ---
 
+## 🆕 v2.2.0 更新内容（本次修复）
+
+### 🐛 关键 Bug 修复
+
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | 生成的图片在对话里**看不到预览** | 聊天正文图片走 `pathImages → localPathMediaUrl → fileMediaUrl`，该链路**只接受绝对路径**，相对路径直接返回 `undefined` | Markdown 图片改为 `encodeURI(绝对路径)`，窗口内即时渲染 |
+| 2 | 图片被存到**错误的目录**（跑进默认工作区） | 插件未在 `inject` 中声明 `sessions`，`ctx.sessions` 抛错被吞，回退到默认工作区 | `inject` 补上 `sessions`，改用 `ctx.sessions.get(sessionId).header.cwd` 精确定位会话工作区 |
+| 3 | 新配置的链路在模型下拉框里**必须重启才出现** | 保存后只写内存与文件，未广播拓扑变更 | 保存时调用 `adapterHandle.replace(['image-chain'])` + 广播 `llm/adapters-updated`，前端同时调用 `modelDirectories.catalog.refresh()`，**免重启秒级刷新** |
+| 4 | 长回复**只输出第一段就断流** | 探针阶段用 `for await ... break`，会触发生成器 `return()` 关闭流 | 改为持有 `iterator` 手动 `next()`，探针后继续读取同一条流 |
+| 5 | 工具调用收尾错乱 | `closeBlocks()` 先清空 `toolBuffers` 再判断 `size > 0`，`finish` 永远是 `stop`；故障转移提示还会留下未闭合的 text block | 新增 `hadToolCalls` 标志；内容块统一由状态机开块/收块，`finish` 正确产出 `tool-calls` |
+| 6 | 插件更新后**设置好的链路被覆盖重置** | 同一份配置既写 `chains.json` 又回写 `cordis.patch.yml`，patch 改动触发 HMR 重载互相打架 | **单一真相源**：只写 `~/.dsh/storages/always-connected/chains.json`，patch 中仅保留 `config: {}` |
+| 7 | 设置面板夜间模式**文字看不见 / 命名框消失** | 硬编码浅色；组件树顶层 `return` 数组漏传 `basics` 子块 | 全面改用 `--dsw-alias-*` 主题变量；选中项实心品牌色 + 白字；补齐漏掉的命名区块 |
+
+### ✨ 稳定性增强
+
+- **重试策略精准化**：仅对 `408 / 409 / 425 / 429 / 5xx` 重试，`400 / 401 / 403 / 404 / 422` 直接切下一模型，不再无谓空耗配额。
+- **首字超时与取消**：首字 90 秒超时；完整透传 `AbortSignal`，用户中断即停。
+- **推理块规范化**：正确产出 `block-start(reasoning) → reasoning-delta → block-end`，`text` / `tool-call` 块使用唯一索引，杜绝块冲突。
+- **设置接口加固**：入参校验（`chains` 为空或缺 `id` 返回 400）、原子写入（tmp + rename）、双路由兼容（`/api/image-chain/settings` 与 `/api/always-connected/settings`）。
+- **设置面板体验**：修改后 600ms 防抖自动保存、空态引导、`GET` 回显 `build` 与存储路径，便于排查。
+
+> ⚠️ 注意：插件 **Host 侧源码改动**无法通过 bundle 启停热更（Cordis 复用 ESM 模块缓存），更新 `index.js` 后需**完整重启 DSH** 一次；重启后 `/api/image-chain/settings` 返回的 `build` 字段可用于确认加载版本。
+
+---
+
 ## 🌟 核心特性
 
 ### 1. ⚡️ 高可用容灾对话链路 (Resilient Chat Fallback Chain)
@@ -60,38 +86,69 @@ dsh plugin install /path/to/dsh-always-connected
 
 ### 方式二：手动配置在 `cordis.patch.yml`
 
-在你的 Profile（例如 `~/.dsh/profiles/desktop/cordis.patch.yml`）中添加插入行：
+在你的 Profile（例如 `~/.dsh/profiles/desktop/cordis.patch.yml`）中添加插入行。**注意：链路配置不再写进 patch**，patch 只负责挂载插件：
 
 ```yaml
-- insert:
-    - id: image-chain
-      name: dsh-always-connected
-      config:
-        chains:
-          - id: chain-resilient-chat
-            name: "高可用容灾对话链路"
-            type: "chat"
-            enabled: true
-            chatConfig:
-              maxRetriesPerModel: 5
-              models:
-                - provider: "cpa"
-                  model: "gemini-3.8-flash-high"
-                - provider: "cpa"
-                  model: "claude-sonnet-4-6"
-                - provider: "workbuddypanel"
-                  model: "cn:deepseek-v4.1-flash"
-          - id: chain-default-image
-            name: "默认绘画链路"
-            type: "image"
-            enabled: true
-            imageConfig:
-              promptModelProvider: "cpa"
-              promptModelId: "gemini-3.8-flash-high"
-              imageModelProvider: "cpa"
-              imageModelId: "gemini-3.1-flash-image"
-              saveDirectory: "images/generated"
+- id: image-chain
+  name: dsh-always-connected
+  config: {}
 ```
+
+安装后首次启动，插件会把内置的默认链路写入独立存储：
+
+```
+~/.dsh/storages/always-connected/chains.json
+```
+
+**这个 JSON 是唯一真相源** —— 之后所有增删改都只写这里，插件升级 / 重装 / 修改 patch 都不会覆盖你的配置。想恢复出厂设置，删掉该文件重启即可。
+
+---
+
+## 🔧 配置字段速查
+
+```jsonc
+[
+  // 绘画链路
+  {
+    "id": "chain-default-image",
+    "name": "gemini绘画",              // 显示在模型选择器里的名字
+    "type": "image",
+    "enabled": true,
+    "imageConfig": {
+      "promptModelProvider": "cpa",     // 模型 A：提示词扩写
+      "promptModelId": "gemini-3.8-flash-high",
+      "imageModelProvider": "cpa",      // 模型 B：绘图
+      "imageModelId": "gemini-3.1-flash-image",
+      "saveDirectory": "images/generated" // 相对会话工作区
+    }
+  },
+  // 容灾对话链路（最多 8 个模型，严格按序串行探测）
+  {
+    "id": "chain-resilient-chat",
+    "name": "高可用容灾对话链路",
+    "type": "chat",
+    "enabled": true,
+    "chatConfig": {
+      "maxRetriesPerModel": 5,
+      "models": [
+        { "provider": "cpa", "model": "gemini-3.8-flash-high" },
+        { "provider": "cpa", "model": "claude-sonnet-4-6" },
+        { "provider": "workbuddypanel", "model": "cn:deepseek-v4.1-flash" }
+      ]
+    }
+  }
+]
+```
+
+---
+
+## 🔌 HTTP 接口（设置面板使用）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/image-chain/settings` | 返回 `currentConfig`、`availableProviders`、`build`、`storageFile` |
+| `POST` | `/api/image-chain/settings` | Body `{ chains: [...] }`，校验通过后原子写入并**热广播**模型拓扑 |
+| 同上 | `/api/always-connected/settings` | 兼容别名，行为完全一致 |
 
 ---
 
