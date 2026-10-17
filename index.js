@@ -84,19 +84,43 @@ function parseSimpleYamlProfiles(content) {
 }
 
 /**
- * 清洗模型A生成的提示词，移除多余前缀与引号
+ * 清洗模型A生成的提示词，移除多余前缀、问候语、中文解析与引号
  */
 function cleanGeneratedPrompt(raw) {
   if (!raw || typeof raw !== 'string') return '';
-  let cleaned = raw.trim();
-  cleaned = cleaned.replace(/^(image\s+)?prompt:\s*/i, '');
-  if ((cleaned.startsWith('"') && cleaned.endsWith('"')) ||
-      (cleaned.startsWith('\'') && cleaned.endsWith('\'')) ||
-      (cleaned.startsWith('`') && cleaned.endsWith('`'))) {
-    cleaned = cleaned.slice(1, -1).trim();
+  let text = raw.trim();
+
+  // 1. 如果包含 Markdown 引用块 > ... 优先提取引用块中的内容
+  const quoteMatches = text.match(/^>\s*(.+)$/gm);
+  if (quoteMatches && quoteMatches.length > 0) {
+    const extracted = quoteMatches.map(line => line.replace(/^>\s*/, '').trim()).join(' ');
+    if (extracted.length > 30) {
+      text = extracted;
+    }
+  } else {
+    // 2. 如果包含 ### 核心英文提示词 (Prompt)：或者类似标记，截取之后的部分
+    const promptHeaderMatch = text.match(/(?:core\s+)?(?:image\s+)?prompt[：:]?\s*\n+([\s\S]+?)(?:\n+---|\n+###|\n+中文|$)/i);
+    if (promptHeaderMatch && promptHeaderMatch[1].trim().length > 20) {
+      text = promptHeaderMatch[1].trim();
+    }
   }
-  cleaned = cleaned.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
-  return cleaned;
+
+  // 3. 移除外层代码块、引号、加粗标记
+  text = text.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+  text = text.replace(/^\*\*([\s\S]+)\*\*$/g, '$1').trim();
+  if ((text.startsWith('"') && text.endsWith('"')) ||
+      (text.startsWith('\'') && text.endsWith('\'')) ||
+      (text.startsWith('`') && text.endsWith('`'))) {
+    text = text.slice(1, -1).trim();
+  }
+
+  // 4. 移除开头的 Prompt: 或 Image Prompt: 前缀
+  text = text.replace(/^(image\s+)?prompt:\s*/i, '');
+
+  // 5. 如果首尾仍有加粗
+  text = text.replace(/^\*\*|\*\*$/g, '').trim();
+
+  return text;
 }
 
 /**
@@ -253,6 +277,11 @@ async function executePaintingChain(chainConfig, userPrompt, workspaceCwd) {
   const promptEndpoint = resolveProviderEndpoint(imageConf.promptModelProvider || 'cpa');
   const imageEndpoint = resolveProviderEndpoint(imageConf.imageModelProvider || 'cpa');
 
+  const defaultInstruction = 'You are an expert AI image prompt engineer. Convert the user\'s drawing request into an exquisite, highly-detailed English prompt for image generation. CRITICAL REQUIREMENT: Output ONLY the final raw English prompt. Do NOT include greetings, intro phrases, markdown headers, Chinese translations, notes, or bullet points. Start immediately with the descriptive image prompt.';
+  const systemPrompt = imageConf.promptSystemInstruction
+    ? `${imageConf.promptSystemInstruction}\n\nCRITICAL REQUIREMENT: Output ONLY the raw descriptive English prompt without any pleasantries, intros, Chinese translations or markdown headers.`
+    : defaultInstruction;
+
   // 1. 调用模型 A 生成精美英文生图提示词
   const promptAUrl = `${promptEndpoint.baseURL.replace(/\/+$/, '')}/chat/completions`;
   const responseA = await fetch(promptAUrl, {
@@ -264,7 +293,7 @@ async function executePaintingChain(chainConfig, userPrompt, workspaceCwd) {
     body: JSON.stringify({
       model: imageConf.promptModelId || 'gemini-3.8-flash-high',
       messages: [
-        { role: 'system', content: imageConf.promptSystemInstruction || 'You are an expert AI image prompt engineer. Convert the user\'s drawing request into an exquisite, highly-detailed English prompt for image generation.' },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt.trim() }
       ],
       temperature: 0.7
@@ -284,7 +313,12 @@ async function executePaintingChain(chainConfig, userPrompt, workspaceCwd) {
     throw new Error(`模型A未能返回有效的提示词内容。响应: ${JSON.stringify(dataA).slice(0, 300)}`);
   }
 
-  // 2. 将模型 A 产出的最终提示词喂给模型 B
+  // 2. 将模型 A 产出的最终提示词喂给模型 B（确保带明确生图指令）
+  const promptLower = finalPrompt.toLowerCase();
+  const imageRequestPrompt = (promptLower.startsWith('generate an image') || promptLower.startsWith('draw an image') || promptLower.startsWith('create an image'))
+    ? finalPrompt
+    : `Generate an image: ${finalPrompt}`;
+
   const imageBUrl = `${imageEndpoint.baseURL.replace(/\/+$/, '')}/chat/completions`;
   const responseB = await fetch(imageBUrl, {
     method: 'POST',
@@ -295,7 +329,7 @@ async function executePaintingChain(chainConfig, userPrompt, workspaceCwd) {
     body: JSON.stringify({
       model: imageConf.imageModelId || 'gemini-3.1-flash-image',
       messages: [
-        { role: 'user', content: finalPrompt }
+        { role: 'user', content: imageRequestPrompt }
       ]
     })
   });
