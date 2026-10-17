@@ -1,5 +1,5 @@
 {
-  "name": "dsh-always-connected",
+  "name": "dsh-plugin-image-chain",
   "version": "2.1.0",
   "description": "DSH-Always-Connected: 全功能模型自由链路插件，提供多阶段AI绘画链路与顺序容灾无缝故障转移对话链路",
   "private": true,

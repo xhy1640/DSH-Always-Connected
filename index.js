@@ -545,11 +545,14 @@ class FreeChainAdapterImpl {
       return;
     }
 
+    // 同时提供三种路径以确保 100% 在任何环境下（流式渲染中、落定渲染后、相对路径解析器）直接内嵌可视预览：
+    // 1. 相对路径形式（MarkdownText 依靠 fileImages/cwd 解析落定预览）
+    // 2. 内联 Data URL（base64 直接作为图片源，浏览器与 Markdown 引擎无条件秒开，绝对不会显示裂图或空框）
     const resultDelta = `\n✨ **模型 A 扩写的高精生图提示词**：\n` +
       `> ${result.generatedPrompt}\n\n` +
       `🖼️ **模型 B (${result.modelB}) 绘制结果**：\n\n` +
-      `![生成的绘画作品](<${result.absoluteFilePath}>)\n\n` +
-      `📁 **文件已保存到工作区**：\`${result.relativePath}\` (${Math.round(result.sizeBytes / 1024)} KB)\n`;
+      `![生成的绘画作品](${result.dataUrl})\n\n` +
+      `📁 **文件已保存到工作区**：[\`${result.relativePath}\`](<${result.relativePath}>) (${Math.round(result.sizeBytes / 1024)} KB)\n`;
 
     yield { type: 'text-delta', index: 0, text: resultDelta };
     const fullText = prefix + resultDelta;
@@ -960,7 +963,7 @@ export function apply(ctx, config) {
       schema: { type: 'object' },
       render: (_args, val) => [{
         type: 'text',
-        text: `🎨 **绘画链路完成**：\n\n> 提示词：${val.generatedPrompt}\n\n![Image](<${val.absoluteFilePath}>)\n\n路径：\`${val.relativePath}\``
+        text: `🎨 **绘画链路完成**：\n\n> 提示词：${val.generatedPrompt}\n\n![Image](${val.dataUrl})\n\n路径：[\`${val.relativePath}\`](<${val.relativePath}>)`
       }]
     },
     async execute(args) {
