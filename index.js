@@ -8,7 +8,7 @@ export const name = 'image-chain';
 export const inject = ['llm', 'tools', 'fs', 'webServer', 'sessions'];
 
 /** Bump on every behavioural change so the Host log proves which generation is live. */
-const BUILD = 'always-connected/2026-10-17.5';
+const BUILD = 'always-connected/2026-10-17.6';
 
 const DEFAULT_CHAINS = [
   {
@@ -258,6 +258,7 @@ function isUserPromptMessage(msg) {
   if (/^Current runtime context/i.test(text)) return false;
   if (/^<system-reminder>[\s\S]*<\/system-reminder>$/i.test(text) || text.startsWith('<system-reminder>')) return false;
   if (/^【meow-memory[\s\S]*提示】[\s\S]*$/i.test(text) && !text.includes('画') && !text.includes('图')) return false;
+  if (/^\[model changed:/i.test(text)) return false;
   return true;
 }
 
@@ -268,6 +269,7 @@ function cleanUserPromptText(raw) {
     .replace(/Current runtime context[\s\S]*$/gis, '')
     .replace(/Time sampled while preparing turn[\s\S]*$/gis, '')
     .replace(/【meow-memory 首次建库提示】[\s\S]*?以上是要点。/gis, '')
+    .replace(/\[model changed:[\s\S]*?\]/gis, '')
     .trim();
   return text;
 }
