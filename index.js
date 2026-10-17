@@ -8,7 +8,7 @@ export const name = 'image-chain';
 export const inject = ['llm', 'tools', 'fs', 'webServer', 'sessions'];
 
 /** Bump on every behavioural change so the Host log proves which generation is live. */
-const BUILD = 'always-connected/2026-10-17.6';
+const BUILD = 'always-connected/2026-10-17.7';
 
 const DEFAULT_CHAINS = [
   {
@@ -41,7 +41,11 @@ const DEFAULT_CHAINS = [
 ];
 
 const DEFAULT_PROMPT_INSTRUCTION =
-  "You are an expert AI image prompt engineer. Convert the user's drawing request into an exquisite, highly-detailed English prompt for image generation.";
+  "You are an expert AI image prompt engineer. Convert the user's drawing request (and reference images if provided) into an exquisite, highly-detailed English prompt for image generation.\n" +
+  "CRITICAL GUIDELINES:\n" +
+  "1. VISUAL FIDELITY: If reference images are provided, thoroughly inspect the character's facial features, hairstyle, ear/tail traits, clothing (maid dress, accessories, colors), body proportions, and aesthetic style, and faithfully describe them in the prompt.\n" +
+  "2. ANTHROPOMORPHISM & GIJINKA: If the user mentions '虚拟形象', '拟人', '娘', or anime character names (e.g. mascot humanization, chibi girl, maid, etc.), ALWAYS depict them as an anime/manga humanized character (Gijinka), NOT a literal animal or beast, unless explicitly requested as a non-human animal.\n" +
+  "3. OUTPUT FORMAT: Output ONLY the raw descriptive English prompt. No greetings, no markdown headers, no Chinese translation, no bullet list, no code fence.";
 
 /* ------------------------------------------------------------------ *
  * Persistent store — the single source of truth for user chains.
@@ -401,34 +405,140 @@ async function callJson(url, apiKey, body, signal) {
   }
 }
 
+async function resolvePromptImages(text, workspace) {
+  const images = [];
+  if (!text || typeof text !== 'string') return images;
+
+  // 1. 查找推特/X 链接并抓取其媒体图片
+  const twitterMatches = text.match(/https?:\/\/(?:twitter\.com|x\.com)\/[A-Za-z0-9_]+\/status\/\d+(?:\/[A-Za-z0-9_]+)*/g) || [];
+  for (const tUrl of twitterMatches.slice(0, 2)) {
+    try {
+      const res = await fetch(tUrl, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const html = await res.text();
+        const mediaUrls = [...new Set(html.match(/https:\/\/pbs\.twimg\.com\/media\/[A-Za-z0-9_-]+/g) || [])];
+        for (const mUrl of mediaUrls.slice(0, 2)) {
+          try {
+            const imgRes = await fetch(`${mUrl}?format=jpg&name=medium`, { signal: AbortSignal.timeout(5000) });
+            if (imgRes.ok) {
+              const buf = Buffer.from(await imgRes.arrayBuffer());
+              if (buf.length > 500) {
+                images.push('data:image/jpeg;base64,' + buf.toString('base64'));
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  // 2. 查找直接图片 URL (jpg/jpeg/png/webp/gif)
+  const directImgMatches = text.match(/https?:\/\/[^\s"'<>)]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s"'<>)]*)?/gi) || [];
+  for (const url of directImgMatches.slice(0, 2)) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const ct = res.headers.get('content-type') || 'image/jpeg';
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > 500) {
+          images.push(`data:${ct.split(';')[0]};base64,` + buf.toString('base64'));
+        }
+      }
+    } catch {}
+  }
+
+  // 3. 查找本地相对/绝对图片引用
+  if (workspace) {
+    const localMatches = text.match(/(?:^|\s)(@?[A-Za-z0-9_./\\-]+\.(?:jpg|jpeg|png|webp|gif))/gi) || [];
+    for (const rawPath of localMatches.slice(0, 2)) {
+      const cleanPath = rawPath.trim().replace(/^@/, '');
+      const absPath = path.isAbsolute(cleanPath) ? cleanPath : path.join(workspace, cleanPath);
+      try {
+        if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
+          const ext = path.extname(absPath).slice(1).toLowerCase();
+          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          const buf = fs.readFileSync(absPath);
+          if (buf.length > 500) {
+            images.push(`data:${mime};base64,` + buf.toString('base64'));
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return images;
+}
+
 async function executePaintingChain(chain, userPrompt, workspace, options = {}) {
   if (!userPrompt || !userPrompt.trim()) throw new Error('绘画要求不能为空。');
 
   const conf = chain.imageConfig || {};
   const promptEndpoint = resolveEndpoint(conf.promptModelProvider || 'cpa');
-  const imageEndpoint = resolveEndpoint(conf.imageModelProvider || 'cpa');
   const signal = options.signal;
 
   const instruction = typeof conf.promptSystemInstruction === 'string' && conf.promptSystemInstruction.trim()
     ? conf.promptSystemInstruction.trim()
     : DEFAULT_PROMPT_INSTRUCTION;
 
-  const a = await callJson(
-    `${promptEndpoint.baseURL}/chat/completions`,
-    promptEndpoint.apiKey,
-    {
-      model: conf.promptModelId || 'gemini-3.8-flash-high',
-      messages: [
+  // 自动解析参考图（推特链接/直接图片URL/本地文件）
+  const refImages = await resolvePromptImages(userPrompt, workspace);
+
+  let userContent;
+  if (refImages.length > 0) {
+    userContent = [
+      {
+        type: 'text',
+        text: `${userPrompt.trim()}\n\n[Vision System Note: The user attached ${refImages.length} reference image(s). You MUST carefully inspect the character appearance, anime/chibi design, clothing, ears/tails, hairstyles, and color palette from the reference image(s) to faithfully incorporate them into the final descriptive prompt.]`
+      }
+    ];
+    for (const imgUrl of refImages) {
+      userContent.push({ type: 'image_url', image_url: { url: imgUrl } });
+    }
+  } else {
+    userContent = userPrompt.trim();
+  }
+
+  let a = null;
+  try {
+    a = await callJson(
+      `${promptEndpoint.baseURL}/chat/completions`,
+      promptEndpoint.apiKey,
+      {
+        model: conf.promptModelId || 'gemini-3.8-flash-high',
+        messages: [
+          {
+            role: 'system',
+            content: `${instruction}\n\nCRITICAL: output ONLY the raw descriptive English prompt. No greetings, no headers, no Chinese translation, no bullet list, no code fence.`
+          },
+          { role: 'user', content: userContent }
+        ],
+        temperature: 0.7
+      },
+      signal
+    );
+  } catch (err) {
+    // 若多模态请求被某些纯文本模型拒绝，安全降级为纯文本重试
+    if (refImages.length > 0) {
+      a = await callJson(
+        `${promptEndpoint.baseURL}/chat/completions`,
+        promptEndpoint.apiKey,
         {
-          role: 'system',
-          content: `${instruction}\n\nCRITICAL: output ONLY the raw descriptive English prompt. No greetings, no headers, no Chinese translation, no bullet list, no code fence.`
+          model: conf.promptModelId || 'gemini-3.8-flash-high',
+          messages: [
+            {
+              role: 'system',
+              content: `${instruction}\n\nCRITICAL: output ONLY the raw descriptive English prompt. No greetings, no headers, no Chinese translation, no bullet list, no code fence.`
+            },
+            { role: 'user', content: userPrompt.trim() }
+          ],
+          temperature: 0.7
         },
-        { role: 'user', content: userPrompt.trim() }
-      ],
-      temperature: 0.7
-    },
-    signal
-  );
+        signal
+      );
+    } else {
+      throw err;
+    }
+  }
 
   const generated = cleanGeneratedPrompt(a?.choices?.[0]?.message?.content);
   if (!generated) throw new Error('提示词模型未返回可用提示词。');
@@ -437,12 +547,40 @@ async function executePaintingChain(chain, userPrompt, workspace, options = {}) 
     ? generated
     : `Generate an image: ${generated}`;
 
-  const b = await callJson(
-    `${imageEndpoint.baseURL}/chat/completions`,
-    imageEndpoint.apiKey,
-    { model: conf.imageModelId || 'gemini-3.1-flash-image', messages: [{ role: 'user', content: request }] },
-    signal
-  );
+  // 绘画模型容灾候选列表
+  const imageCandidates = [];
+  if (conf.imageModelProvider && conf.imageModelId) {
+    imageCandidates.push({ provider: conf.imageModelProvider, model: conf.imageModelId });
+  }
+  if (!imageCandidates.some(c => c.provider === 'cpa' && c.model === 'gemini-3.1-flash-image')) {
+    imageCandidates.push({ provider: 'cpa', model: 'gemini-3.1-flash-image' });
+  }
+
+  let b = null;
+  let lastImageError = null;
+  let activeImageCand = null;
+
+  for (const cand of imageCandidates) {
+    try {
+      const ep = resolveEndpoint(cand.provider);
+      b = await callJson(
+        `${ep.baseURL}/chat/completions`,
+        ep.apiKey,
+        { model: cand.model, messages: [{ role: 'user', content: request }] },
+        signal
+      );
+      if (b?.choices?.[0]?.message) {
+        activeImageCand = cand;
+        break;
+      }
+    } catch (err) {
+      lastImageError = err;
+    }
+  }
+
+  if (!b && lastImageError) {
+    throw new Error(`绘画模型失败: ${lastImageError?.message || lastImageError}`);
+  }
 
   const message = b?.choices?.[0]?.message;
   let base64 = null;
@@ -491,7 +629,7 @@ async function executePaintingChain(chain, userPrompt, workspace, options = {}) 
     markdownPath: markdownPath(workspace, file),
     sizeBytes: buffer.length,
     modelA: conf.promptModelId || 'gemini-3.8-flash-high',
-    modelB: conf.imageModelId || 'gemini-3.1-flash-image'
+    modelB: activeImageCand?.model || conf.imageModelId || 'gemini-3.1-flash-image'
   };
 }
 
