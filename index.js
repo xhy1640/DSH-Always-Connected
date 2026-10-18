@@ -8,7 +8,7 @@ export const name = 'image-chain';
 export const inject = ['llm', 'tools', 'fs', 'webServer', 'sessions'];
 
 /** Bump on every behavioural change so the Host log proves which generation is live. */
-const BUILD = 'always-connected/2026-10-17.7';
+const BUILD = 'always-connected/2026-10-18.1';
 
 const DEFAULT_CHAINS = [
   {
@@ -58,6 +58,26 @@ function dshHome() {
 
 const STORAGE_DIR = path.join(dshHome(), 'storages', 'always-connected');
 const STORAGE_FILE = path.join(STORAGE_DIR, 'chains.json');
+const STATE_FILE = path.join(STORAGE_DIR, 'active_state.json');
+
+function loadActiveStates() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) || {};
+    }
+  } catch {}
+  return {};
+}
+
+function saveActiveState(chainId, index) {
+  try {
+    const states = loadActiveStates();
+    states[chainId] = index;
+    const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(states, null, 2), 'utf8');
+    fs.renameSync(tmp, STATE_FILE);
+  } catch (err) {}
+}
 
 function sanitizeChains(value) {
   if (!Array.isArray(value)) return null;
@@ -469,7 +489,7 @@ async function resolvePromptImages(text, workspace) {
   return images;
 }
 
-async function executePaintingChain(chain, userPrompt, workspace, options = {}) {
+async function executePaintingChain(chain, userPrompt, workspace, options = {}, adapter = null) {
   if (!userPrompt || !userPrompt.trim()) throw new Error('绘画要求不能为空。');
 
   const conf = chain.imageConfig || {};
@@ -679,6 +699,17 @@ class FreeChainAdapter {
   constructor(getConfig, ctx) {
     this.getConfig = getConfig;
     this.ctx = ctx;
+    this.activeChatIndex = new Map(); // chainId -> index
+    this.activeImageIndex = new Map(); // chainId -> index
+    try {
+      const states = loadActiveStates();
+      for (const [k, v] of Object.entries(states)) {
+        if (typeof v === 'number') {
+          if (k.endsWith(':image')) this.activeImageIndex.set(k.slice(0, -6), v);
+          else this.activeChatIndex.set(k, v);
+        }
+      }
+    } catch {}
   }
 
   providerInfo(provider) {
@@ -777,7 +808,7 @@ class FreeChainAdapter {
 
     let text = `${header}⏳ 正在生成提示词并绘制...\n`;
     try {
-      const result = await executePaintingChain(chain, prompt, workspace, { signal: options.signal });
+      const result = await executePaintingChain(chain, prompt, workspace, { signal: options.signal }, this);
       const tail =
         `\n✅ **完成**\n\n` +
         `**扩写后的提示词**\n\n> ${result.generatedPrompt.replace(/\n/g, '\n> ')}\n\n` +
@@ -817,7 +848,14 @@ class FreeChainAdapter {
     const tools = convertTools(options.tools);
     const failures = [];
 
-    for (let index = 0; index < candidates.length; index++) {
+    const startIndex = this.activeChatIndex.get(chain.id) || 0;
+    const probeOrder = [];
+    for (let i = 0; i < candidates.length; i++) {
+      probeOrder.push((startIndex + i) % candidates.length);
+    }
+
+    for (let pIdx = 0; pIdx < probeOrder.length; pIdx++) {
+      const index = probeOrder[pIdx];
       const candidate = candidates[index];
       const endpoint = resolveEndpoint(candidate.provider);
       const label = `${candidate.provider} / ${candidate.model}`;
@@ -887,6 +925,8 @@ class FreeChainAdapter {
           }
 
           // Committed: this model answered, stream the rest live.
+          this.activeChatIndex.set(chain.id, index);
+          saveActiveState(chain.id, index);
           const state = {
             textOpen: false,
             reasoningOpen: false,
@@ -899,7 +939,7 @@ class FreeChainAdapter {
             reasoningIndex: 0
           };
 
-          if (failures.length > 0) {
+          if (index !== startIndex) {
             const note = `> ⚠️ 已自动切换：次序 ${index + 1} · \`${label}\`\n\n`;
             state.textIndex = state.nextIndex++;
             state.textOpen = true;
