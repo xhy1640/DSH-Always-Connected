@@ -496,9 +496,10 @@ async function executePaintingChain(chain, userPrompt, workspace, options = {}, 
   const promptEndpoint = resolveEndpoint(conf.promptModelProvider || 'cpa');
   const signal = options.signal;
 
+  const baseInstruction = getSkillPromptInstruction();
   const instruction = typeof conf.promptSystemInstruction === 'string' && conf.promptSystemInstruction.trim()
-    ? conf.promptSystemInstruction.trim()
-    : DEFAULT_PROMPT_INSTRUCTION;
+    ? `${conf.promptSystemInstruction.trim()}\n\n${baseInstruction}`
+    : baseInstruction;
 
   // 自动解析参考图（推特链接/直接图片URL/本地文件）
   const refImages = await resolvePromptImages(userPrompt, workspace);
