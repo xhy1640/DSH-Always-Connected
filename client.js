@@ -92,22 +92,47 @@ window.__ModuleLoader__.load({
       const [storage, setStorage] = useState('');
       const chainsRef = useRef([]);
       const timerRef = useRef(null);
+      const flashRef = useRef(null);
+      // One in-flight save at a time: two overlapping POSTs race, and whichever
+      // response lands last wins — which can leave the server holding the older
+      // chain list while the panel shows the newer one.
+      const saveRef = useRef(null);
+      const aliveRef = useRef(true);
+
+      useEffect(() => () => {
+        aliveRef.current = false;
+        if (timerRef.current) clearTimeout(timerRef.current);
+        if (flashRef.current) clearTimeout(flashRef.current);
+        // Abort an in-flight save so its handler cannot set state after unmount.
+        saveRef.current?.abort();
+      }, []);
 
       const flash = useCallback(message => {
         setNotice(message);
-        setTimeout(() => setNotice(current => (current === message ? '' : current)), 2200);
+        if (flashRef.current) clearTimeout(flashRef.current);
+        flashRef.current = setTimeout(() => {
+          flashRef.current = null;
+          setNotice(current => (current === message ? '' : current));
+        }, 2200);
       }, []);
 
       const persist = useCallback(async list => {
+        // Supersede any earlier save: its response is stale by definition.
+        saveRef.current?.abort();
+        const controller = new AbortController();
+        saveRef.current = controller;
+        const timeout = setTimeout(() => controller.abort(), 15000);
         setSaving(true);
         setError('');
         try {
           const response = await fetch('/api/image-chain/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chains: list })
+            body: JSON.stringify({ chains: list }),
+            signal: controller.signal
           });
           const data = await response.json();
+          if (!aliveRef.current || saveRef.current !== controller) return;
           if (!response.ok || !data.ok) throw new Error(data?.error || `HTTP ${response.status}`);
           flash('已保存');
 
@@ -119,9 +144,14 @@ window.__ModuleLoader__.load({
             console.warn('[always-connected] refresh catalog error:', e);
           }
         } catch (cause) {
-          setError(`保存失败：${cause.message}`);
+          if (!aliveRef.current || saveRef.current !== controller) return;
+          setError(cause?.name === 'AbortError' ? '保存超时，请重试' : `保存失败：${cause.message}`);
         } finally {
-          setSaving(false);
+          clearTimeout(timeout);
+          if (saveRef.current === controller) {
+            saveRef.current = null;
+            if (aliveRef.current) setSaving(false);
+          }
         }
       }, [flash]);
 
@@ -155,7 +185,6 @@ window.__ModuleLoader__.load({
         })();
         return () => {
           alive = false;
-          if (timerRef.current) clearTimeout(timerRef.current);
         };
       }, []);
 
