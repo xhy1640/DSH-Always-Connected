@@ -8,7 +8,7 @@ export const name = 'image-chain';
 export const inject = ['llm', 'tools', 'fs', 'webServer', 'sessions'];
 
 /** Bump on every behavioural change so the Host log proves which generation is live. */
-const BUILD = 'always-connected/2026-10-21.2';
+const BUILD = 'always-connected/2026-10-21.3';
 
 /**
  * Declared context capacity for every chat chain model.
@@ -113,26 +113,6 @@ function resolveContextWindow(config) {
 
 const STORAGE_DIR = path.join(dshHome(), 'storages', 'always-connected');
 const STORAGE_FILE = path.join(STORAGE_DIR, 'chains.json');
-const STATE_FILE = path.join(STORAGE_DIR, 'active_state.json');
-
-function loadActiveStates() {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) || {};
-    }
-  } catch {}
-  return {};
-}
-
-function saveActiveState(chainId, index) {
-  try {
-    const states = loadActiveStates();
-    states[chainId] = index;
-    const tmp = `${STATE_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(states, null, 2), 'utf8');
-    fs.renameSync(tmp, STATE_FILE);
-  } catch (err) {}
-}
 
 function sanitizeChains(value) {
   if (!Array.isArray(value)) return null;
@@ -970,17 +950,18 @@ class FreeChainAdapter {
   constructor(getConfig, ctx) {
     this.getConfig = getConfig;
     this.ctx = ctx;
-    this.activeChatIndex = new Map(); // chainId -> index
-    this.activeImageIndex = new Map(); // chainId -> index
-    try {
-      const states = loadActiveStates();
-      for (const [k, v] of Object.entries(states)) {
-        if (typeof v === 'number') {
-          if (k.endsWith(':image')) this.activeImageIndex.set(k.slice(0, -6), v);
-          else this.activeChatIndex.set(k, v);
-        }
-      }
-    } catch {}
+    /**
+     * Failover position, scoped to ONE user turn.
+     *
+     * This used to be a per-chain map persisted to `active_state.json`, which
+     * made a failover permanent: once model 1 failed, every later turn — and
+     * every later process start — began at model 2, even after model 1
+     * recovered. The desired behaviour is the opposite: the switch is only valid
+     * for the remainder of the turn it happened in (so a multi-step turn does
+     * not re-probe a dead model on every step), and the next user message starts
+     * again from the chain's first candidate.
+     */
+    this.turnFailover = new Map(); // chainId -> index, cleared at each turn boundary
   }
 
   providerInfo(provider) {
@@ -1078,9 +1059,82 @@ class FreeChainAdapter {
     }
     if (chain.type === 'image') {
       yield* this.streamImageChain(chain, options);
-    } else {
-      yield* this.streamChatChain(chain, options);
+      return;
     }
+
+    // A failover recorded during this call only carries into the next step of
+    // the same turn, and only if this call actually produced a terminal
+    // `finish` without the user cancelling. An abort, a stalled stream, or a
+    // consumer that stops iterating leaves the turn unfinished, so its failover
+    // is dropped here and the next message probes the chain from candidate 1.
+    let completed = false;
+    try {
+      for await (const chunk of this.streamChatChain(chain, options)) {
+        if (chunk?.type === 'finish' && chunk.reason?.kind !== 'aborted' && chunk.reason?.kind !== 'error') {
+          completed = true;
+        }
+        yield chunk;
+      }
+    } finally {
+      if (!completed || options.signal?.aborted) this.turnFailover.delete(chain.id);
+    }
+  }
+
+  /**
+   * Detect the boundary between two user turns.
+   *
+   * `options.messages` is the whole replayable history, so the request for a
+   * follow-up user message contains every earlier user message too. A turn
+   * boundary is therefore "the last user-authored message changed": within one
+   * turn the agent loop appends tool results and runtime-context snapshots but
+   * never a second user message, so this key stays stable across the tool-call
+   * steps of a turn and moves exactly once when the user speaks again.
+   *
+   * The key is the last user message's identity (its id when the harness
+   * supplies one, otherwise its position plus text), which is stable across the
+   * per-step projections of the same message.
+   */
+  turnKey(messages) {
+    if (!Array.isArray(messages)) return 'none';
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message?.role !== 'user') continue;
+      const sourceKind = message.source?.kind;
+      // Runtime-context snapshots and injected reminders ride in as user-role
+      // messages; only an actual user message moves the boundary.
+      if (sourceKind && sourceKind !== 'user') continue;
+      const text = flattenContent(message.content);
+      return `${i}:${message.id ?? ''}:${text.length}:${text.slice(0, 64)}`;
+    }
+    return 'none';
+  }
+
+  /**
+   * Pick the candidate this request starts from.
+   *
+   * A failover recorded earlier in the same turn is honored (so the remaining
+   * tool-call steps do not re-probe the dead model). A new user message starts
+   * over from the chain's first candidate, which is the whole point: recovery of
+   * model 1 must not require restarting the app.
+   */
+  currentStartIndex(chain, candidates, options) {
+    const key = this.turnKey(options.messages);
+    const previous = this.turnFailover.get(chain.id);
+    if (previous && previous.turnKey === key) {
+      const index = Number.isInteger(previous.index) ? previous.index : 0;
+      return index >= 0 && index < candidates.length ? index : 0;
+    }
+    if (previous) this.turnFailover.delete(chain.id);
+    return 0;
+  }
+
+  /** Remember a failover for the rest of the current turn only. */
+  recordFailover(chain, candidates, options, index) {
+    if (!Number.isInteger(index) || index <= 0 || index >= candidates.length) {
+      this.turnFailover.delete(chain.id);
+      return;
+    }
+    this.turnFailover.set(chain.id, { turnKey: this.turnKey(options.messages), index });
   }
 
   async *streamImageChain(chain, options) {
@@ -1160,7 +1214,10 @@ class FreeChainAdapter {
     // is what let a 1M-token request look like 600k and skipped compaction.
     baseBody.stream_options = { include_usage: true };
 
-    const startIndex = this.activeChatIndex.get(chain.id) || 0;
+    // A tool-call step of the same user turn keeps using the model that already
+    // answered, so a stalled model is probed once per turn, not once per step.
+    // A new user message resets this (see currentStartIndex).
+    const startIndex = this.currentStartIndex(chain, candidates, options);
     const probeOrder = [];
     for (let i = 0; i < candidates.length; i++) {
       probeOrder.push((startIndex + i) % candidates.length);
@@ -1265,8 +1322,9 @@ class FreeChainAdapter {
           // Committed: this model answered, stream the rest live. From here the
           // deadline becomes an inter-chunk idle deadline.
           armIdle();
-          this.activeChatIndex.set(chain.id, index);
-          saveActiveState(chain.id, index);
+          // Sticky for the rest of *this* turn only; the next user message starts
+          // from the chain's first candidate again.
+          this.recordFailover(chain, candidates, options, index);
           const state = {
             textOpen: false,
             reasoningOpen: false,
@@ -1344,6 +1402,11 @@ class FreeChainAdapter {
             ? '连接或响应超时'
             : (error?.message || String(error));
           if (options.signal?.aborted) {
+            // An interrupted turn leaves no failover behind: the user's next
+            // message must probe the chain from its first candidate even if it
+            // repeats the same text (which would otherwise look like the same
+            // turn to the boundary key).
+            this.turnFailover.delete(chain.id);
             yield* this.abortedFinish();
             return;
           }
